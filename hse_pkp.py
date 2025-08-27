@@ -24,10 +24,10 @@ def prepare_water_line_limitations(
     gdf['geometry'] = gdf['geometry'].line_merge()
     
     # пересчитать в WGS-84 для вычисления геодезических расстояний
-    gdf = gdf.to_crs(4326)    
-    geod = Geod(ellps='WGS84')
+    gdf = gdf.to_crs(4326)
     
     # рассчитать геодезические длины
+    geod = Geod(ellps='WGS84')
     gdf['length_geod'] = [geod.geometry_length(row['geometry']) for i, row in gdf.iterrows()]    
     # gdf.to_file('result/water_line.gpkg', layer='water_line_dissolved')
 
