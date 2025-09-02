@@ -4,6 +4,8 @@ import pandas as pd
 from pyproj import Geod, crs, Transformer
 import shapely
 import re
+import json
+import sqlalchemy
 
 
 def calculate_geod_buffers(
@@ -177,12 +179,49 @@ def prepare_water_limitations(
     water_prot_zone.to_file(result_gpkg, layer='water_prot_zone')
 
 
-if __name__ == '__main__':
-    prepare_water_limitations(
-        source_water_line='data/Lipetsk_water_lines_3857/Lipetsk_water_lines_3857.shp',
-        source_water_pol='data/Lipetsk_water_poly_3857/Lipetsk_water_poly_3857.shp',
-        result_gpkg='result/water_limitations.gpkg',
-        buffer_distance = 5,
-        buffer_crs = 'utm'
+def prepare_slope_limitations(
+    region='', 
+    regions_table='admin.hse_russia_regions', 
+    fabdem_tiles_table='elevation.fabdem_v1_2_tiles'
+    ):
+    try:
+        with open('.secret/.gdcdb', encoding='utf-8') as f:
+            pg = json.load(f)
+    except:
+        raise
+    try:
+        engine = sqlalchemy.create_engine(
+            f"postgresql+psycopg2://{pg['user']}:{pg['password']}@{pg['host']}:{pg['port']}/{pg['database']}",
+            connect_args={
+                "sslmode": "verify-full",
+                "target_session_attrs": "read-write"
+                # "sslcert": "/path/to/client.crt",
+                # "sslkey": "/path/to/client.key",
+                # "sslrootcert": "/path/to/ca.crt",
+            },
         )
+        pass
+    except:
+        raise
+    try:
+        sql = f"select * from {regions_table} where lower(region) = '{region.lower()}';"
+        # region_gdf = gpd.read_postgis(sql, engine)
+        sql = f"select * from {fabdem_tiles_table} fbdm where ST_Intersects((select geom from {regions_table} where lower(region) = '{region.lower()}' limit 1), fbdm.geom);"
+        tiles_gdf = gpd.read_postgis(sql, engine)
+    except:
+        raise
+    pass
+    
+
+
+if __name__ == '__main__':
+    # prepare_water_limitations(
+    #     source_water_line='data/Lipetsk_water_lines_3857/Lipetsk_water_lines_3857.shp',
+    #     source_water_pol='data/Lipetsk_water_poly_3857/Lipetsk_water_poly_3857.shp',
+    #     result_gpkg='result/water_limitations.gpkg',
+    #     buffer_distance = 5,
+    #     buffer_crs = 'utm'
+    #     )
+    
+    prepare_slope_limitations(region='Липецкая область')
     

@@ -6,5 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "geopandas>=1.1.1",
+    "psycopg2-binary>=2.9.10",
     "pyproj>=3.7.1",
+    "sqlalchemy>=2.0.43",
 ]
