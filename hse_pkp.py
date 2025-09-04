@@ -218,7 +218,7 @@ def prepare_slope_limitations(
         raise
     try:
         sql = f"select * from {regions_table} where lower(region) = '{region.lower()}';"
-        # region_gdf = gpd.read_postgis(sql, engine)
+        region_gdf = gpd.read_postgis(sql, engine)
         sql = f"select * from {fabdem_tiles_table} fbdm where ST_Intersects((select geom from {regions_table} where lower(region) = '{region.lower()}' limit 1), fbdm.geom);"
         tiles_gdf = gpd.read_postgis(sql, engine)
     except:
@@ -320,6 +320,7 @@ def prepare_slope_limitations(
                 print(err)
         pass
     if not final_gdf.empty:
+        final_gdf = final_gdf.clip(region_gdf)
         final_gdf.to_file('result/slope_limitations.gpkg', layer=region)
         pass
         
