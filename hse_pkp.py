@@ -6,6 +6,16 @@ import shapely
 import re
 import json
 import sqlalchemy
+from zipfile import ZipFile
+import os
+import rasterio
+import rasterio.features
+import numpy as np
+from tqdm import tqdm
+
+# Сложности https://github.com/astral-sh/uv/issues/11466
+from osgeo import gdal
+from osgeo_utils import gdal_calc
 
 
 def calculate_geod_buffers(
@@ -181,9 +191,12 @@ def prepare_water_limitations(
 
 def prepare_slope_limitations(
     region='', 
+    slope_threshold = 12,
     regions_table='admin.hse_russia_regions', 
-    fabdem_tiles_table='elevation.fabdem_v1_2_tiles'
+    fabdem_tiles_table='elevation.fabdem_v1_2_tiles',
+    fabdem_zip_path=r"\\172.21.204.20\geodata\_PROJECTS\pkp\vm0047_prod\dem_fabdem"
     ):
+    
     try:
         with open('.secret/.gdcdb', encoding='utf-8') as f:
             pg = json.load(f)
@@ -211,7 +224,105 @@ def prepare_slope_limitations(
     except:
         raise
     pass
-    
+
+    current_dir = os.getcwd()
+    os.environ["PROJ_LIB"] = os.path.join(current_dir, '.venv', 'Lib', 'site-packages', 'osgeo', 'data', 'proj')
+    fabdemdir = os.path.join(current_dir, 'fabdem')
+    if not os.path.isdir(fabdemdir):
+        os.mkdir(fabdemdir)
+    final_gdf = None
+    #tqdm(gdf.iterrows(), desc='tiles loop', total=gdf.shape[0])
+    for i, row in tqdm(tiles_gdf.iterrows(), desc='tiles loop', total=tiles_gdf.shape[0]):
+        lon = row['geom'].centroid.x
+        lat = row['geom'].centroid.y
+        zipfilename = row['zipfile_name']
+        filename = row['file_name'].replace("N0", "N")
+        zippath = os.path.join(fabdem_zip_path, zipfilename)
+        try:
+            with ZipFile(zippath, 'r') as zObject:
+                zObject.extract(filename, path=fabdemdir)
+            # print(f"Successfully extracted '{file_to_extract}' to '{destination_directory}'")
+        except:
+            raise
+        input_file = os.path.join(fabdemdir, filename)
+        input_dem = gdal.Open(input_file)
+        if input_dem:
+            target_crs = f"+proj=tmerc +lat_0=0 +lon_0={lon} " \
+                f"+k=0.9996 +x_0=500000 +y_0=0 +ellps=WGS84 " \
+                f"+units=m +no_defs +type=crs"
+            output_utm = os.path.join(fabdemdir, filename.replace('.tif', '_utm.tif'))
+            gdal.Warp(output_utm, input_dem, dstSRS=target_crs)
+            pass
+        input_dem = None
+        input_dem = gdal.Open(output_utm)
+        
+        output_slope = os.path.join(fabdemdir, filename.replace('.tif', '_slope.tif'))
+        if input_dem is None:
+            print(f"Error: Could not open {os.path.join(fabdemdir, filename)}")
+        else:
+            # https://gdal.org/en/stable/api/python/utilities.html#osgeo.gdal.DEMProcessing
+            gdal.DEMProcessing(
+                output_slope, input_dem, "slope", computeEdges=True, slopeFormat="degree"
+                # , scale=111100    # Это если в градусах
+                )
+            print(f"Slope calculated and saved to {output_slope}")
+            pass
+        output_slope_reclass = os.path.join(fabdemdir, filename.replace('.tif', '_slope_reclass.tif'))
+        calc_expression = f"(A>={slope_threshold})*1"
+        # # gdal_calc = os.path.join(current_dir, '.venv', 'Scripts', 'gdal_calc.py')
+        # gdal_calc = os.path.join('.venv', 'Scripts', 'gdal_calc.py')
+        # # gdal_calc = gdal_calc.replace(r'\\\\', '\\')
+        # # gdal_calc = r'.\.venv\Scripts\gdal_calc.py'
+        # command = [
+        #     'python3', 
+        #     gdal_calc,
+        #     "-A", output_slope,
+        #     "--calc", calc_expression,
+        #     "--outfile", output_slope_reclass,
+        #     "--overwrite" # Optional: Overwrite if output_raster exists
+        # ]
+        # subprocess.run(command, check=True)
+        # os.environ["PROJ_LIB"] = r"D:\PROG\HSE\hse_pkp\.venv\Lib\site-packages\osgeo\data\proj"
+        
+        my_var_value = os.environ["PROJ_LIB"]
+        ds = gdal_calc.Calc(calc_expression, A=output_slope, outfile=output_slope_reclass, overwrite=True)
+        pass
+        
+        # https://www.google.com/search?q=python+rasterio+polygonize&sca_esv=7550878c098e0420&ei=AqK5aIbtPLqbwPAPxvCE6A8&ved=0ahUKEwiG9ujCqL-PAxW6DRAIHUY4Af0Q4dUDCBA&uact=5&oq=python+rasterio+polygonize&gs_lp=Egxnd3Mtd2l6LXNlcnAiGnB5dGhvbiByYXN0ZXJpbyBwb2x5Z29uaXplMgUQABjvBTIFEAAY7wUyBRAAGO8FSMUYUPQGWMIRcAF4AZABAJgBhwGgAbIEqgEDNy4xuAEDyAEA-AEBmAIIoALCA8ICChAAGLADGNYEGEfCAggQABgHGAgYHsICCBAAGIAEGKIEwgILEAAYgAQYhgMYigXCAgYQABgIGB6YAwCIBgGQBgiSBwE4oAfaFrIHATe4B7kDwgcFMC43LjHIBxM&sclient=gws-wiz-serp
+        with rasterio.open(output_slope_reclass) as src:
+            image = src.read(1)
+            transform = src.transform
+            crs = src.crs
+            # mask = (image != 0 and image != src.nodata)
+            mask = (image == 1)
+            results = (
+                {'properties': {'raster_val': v}, 'geometry': s}
+                for i, (s, v) in enumerate(
+                    rasterio.features.shapes(image, mask=mask, transform=transform) # Replace mask=None with your mask if needed
+                )
+            )
+            geoms = list(results)
+            gdf = gpd.GeoDataFrame.from_features(geoms)
+            gdf = gdf.set_crs(crs)
+            gdf = gdf.to_crs('EPSG:4326')
+            if i == 0:
+                final_gdf = gdf                
+            else:
+                final_gdf = pd.concat([final_gdf, gdf], ignore_index=True)
+            # gdf.to_file('result/slope_limitations.gpkg', layer=filename.replace('.tif', '_slope'))
+            
+        ds = None
+        input_dem = None
+        for fl in [output_slope, output_slope_reclass, output_utm, input_file]:
+            try:
+                os.remove(fl)
+            except Exception as err:
+                print(err)
+        pass
+    if not final_gdf.empty:
+        final_gdf.to_file('result/slope_limitations.gpkg', layer=region)
+        pass
+        
 
 
 if __name__ == '__main__':
@@ -223,5 +334,9 @@ if __name__ == '__main__':
     #     buffer_crs = 'utm'
     #     )
     
-    prepare_slope_limitations(region='Липецкая область')
+    prepare_slope_limitations(
+        region='Липецкая область',
+        slope_threshold=12,
+        fabdem_zip_path=r"\\172.21.204.20\geodata\_PROJECTS\pkp\vm0047_prod\dem_fabdem"
+    )
     
