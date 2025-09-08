@@ -195,7 +195,9 @@ def prepare_slope_limitations(
     slope_threshold = 12,
     regions_table='admin.hse_russia_regions', 
     fabdem_tiles_table='elevation.fabdem_v1_2_tiles',
-    fabdem_zip_path=r"\\172.21.204.20\geodata\_PROJECTS\pkp\vm0047_prod\dem_fabdem"
+    fabdem_zip_path=r"\\172.21.204.20\geodata\_PROJECTS\pkp\vm0047_prod\dem_fabdem",
+    rescale=True,
+    rescale_size=10
     ):
     
     try:
@@ -234,9 +236,13 @@ def prepare_slope_limitations(
     if not os.path.isdir(fabdemdir):
         os.mkdir(fabdemdir)
     final_gdf = None
+
+    region_centr_lat = region_gdf.iloc[0]['geom'].centroid.y
+    region_centr_lon = region_gdf.iloc[0]['geom'].centroid.x
+
     for i, row in tqdm(tiles_gdf.iterrows(), desc='tiles loop', total=tiles_gdf.shape[0]):
         lon = row['geom'].centroid.x
-        # lat = row['geom'].centroid.y
+        lat = row['geom'].centroid.y
         
         # extract current Fabdem tile
         zipfilename = row['zipfile_name']
@@ -253,38 +259,51 @@ def prepare_slope_limitations(
         
         # reproject to TM
         if input_dem:
-            target_crs = f"+proj=tmerc +lat_0=0 +lon_0={lon} " \
-                f"+k=0.9996 +x_0=500000 +y_0=0 +ellps=WGS84 " \
-                f"+units=m +no_defs +type=crs"
-            output_utm = os.path.join(fabdemdir, filename.replace('.tif', '_utm.tif'))
-            gdal.Warp(output_utm, input_dem, dstSRS=target_crs)
+            # # UTM:
+            # target_crs = f"+proj=tmerc +lat_0=0 +lon_0={lon} " \
+            #     f"+k=0.9996 +x_0=500000 +y_0=0 +ellps=WGS84 " \
+            #     f"+units=m +no_defs +type=crs"
+            # LAEA:
+            target_crs = f"+proj=laea +lat_0={region_centr_lat} +lon_0={ region_centr_lon} " \
+                         f"+x_0=4321000 +y_0=3210000 +ellps=WGS84 +units=m +no_defs"
+            # # LAEA EPSG:3035
+            # target_crs = f"+proj=laea +lat_0=52 +lon_0=10 " \
+            #              f"+x_0=4321000 +y_0=3210000 +ellps=WGS84 +units=m +no_defs"
+            
+            output_reproj = os.path.join(fabdemdir, filename.replace('.tif', '_reproj.tif'))
+            gdal.Warp(output_reproj, input_dem, dstSRS=target_crs)
             
             # temp_ds = temp_driver.Create('', 1, 1, 1, gdal.GDT_Byte)
             # gdal.Warp(temp_ds, input_dem, dstSRS=target_crs)
-            
+            input_dem = None
+            input_dem = gdal.Open(output_reproj)
             pass
         
         # Rescaling with improved options
-        rescale_options = gdal.WarpOptions(
-            xRes=10,
-            yRes=10,
-            resampleAlg='bilinear',
-            outputType=gdal.GDT_Float32,  # Specify output data type
-            creationOptions=['COMPRESS=LZW', 'TILED=YES'],  # Compression and tiling
-            multithread=True  # Enable multithreading for better performance
-        )
-        output_rescale = os.path.join(fabdemdir, filename.replace('.tif', '_utm_rescale.tif'))
-        input_dem = None
-        input_dem = gdal.Open(output_utm)
-        if input_dem is None:
-            print(f"Error: Could not open {output_utm}")
-        else:
-            gdal.Warp(output_rescale, input_dem, options=rescale_options)
-            # gdal.Warp(output_rescale, temp_ds, options=rescale_options)        
+        output_rescale = None
+        if rescale:
+            rescale_options = gdal.WarpOptions(
+                xRes=rescale_size,
+                yRes=rescale_size,
+                resampleAlg='bilinear',
+                outputType=gdal.GDT_Float32,  # Specify output data type
+                creationOptions=['COMPRESS=LZW', 'TILED=YES'],  # Compression and tiling
+                multithread=True  # Enable multithreading for better performance
+            )
+            output_rescale = os.path.join(fabdemdir, filename.replace('.tif', '_utm_rescale.tif'))
+            input_dem = None
+            input_dem = gdal.Open(output_reproj)
+            if input_dem is None:
+                print(f"Error: Could not open {output_reproj}")
+            else:
+                gdal.Warp(output_rescale, input_dem, options=rescale_options)
+                input_dem = None
+                input_dem = gdal.Open(output_rescale)
+                # gdal.Warp(output_rescale, temp_ds, options=rescale_options)        
         
         # Calculate slope
-        input_dem = None
-        input_dem = gdal.Open(output_rescale)        
+        # input_dem = None
+        # input_dem = gdal.Open(output_rescale)        
         output_slope = os.path.join(fabdemdir, filename.replace('.tif', '_slope.tif'))
         if input_dem is None:
             print(f"Error: Could not open {os.path.join(fabdemdir, filename)}")
@@ -330,7 +349,7 @@ def prepare_slope_limitations(
         ds = None
         input_dem = None
         # Delete intermediate rasters
-        for fl in [output_slope, output_slope_reclass, output_utm, input_file, output_rescale]:
+        for fl in [output_slope, output_slope_reclass, output_reproj, input_file, output_rescale]:
             try:
                 os.remove(fl)
             except Exception as err:
@@ -353,6 +372,8 @@ if __name__ == '__main__':
     prepare_slope_limitations(
         region='Липецкая область',
         slope_threshold=12,
-        fabdem_zip_path=r"\\172.21.204.20\geodata\_PROJECTS\pkp\vm0047_prod\dem_fabdem"
+        fabdem_zip_path=r"\\172.21.204.20\geodata\_PROJECTS\pkp\vm0047_prod\dem_fabdem",
+        rescale=True,
+        rescale_size=10
     )
     
