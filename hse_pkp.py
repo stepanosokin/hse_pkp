@@ -15,6 +15,7 @@ from tqdm import tqdm
 
 # Сложности https://github.com/astral-sh/uv/issues/11466
 from osgeo import gdal
+from osgeo import gdal_array
 from osgeo_utils import gdal_calc
 
 
@@ -225,16 +226,19 @@ def prepare_slope_limitations(
         raise
     pass
 
+    # temp_driver = gdal.GetDriverByName('MEM')
+
     current_dir = os.getcwd()
     os.environ["PROJ_LIB"] = os.path.join(current_dir, '.venv', 'Lib', 'site-packages', 'osgeo', 'data', 'proj')
     fabdemdir = os.path.join(current_dir, 'fabdem')
     if not os.path.isdir(fabdemdir):
         os.mkdir(fabdemdir)
     final_gdf = None
-    #tqdm(gdf.iterrows(), desc='tiles loop', total=gdf.shape[0])
     for i, row in tqdm(tiles_gdf.iterrows(), desc='tiles loop', total=tiles_gdf.shape[0]):
         lon = row['geom'].centroid.x
-        lat = row['geom'].centroid.y
+        # lat = row['geom'].centroid.y
+        
+        # extract current Fabdem tile
         zipfilename = row['zipfile_name']
         filename = row['file_name'].replace("N0", "N")
         zippath = os.path.join(fabdem_zip_path, zipfilename)
@@ -246,16 +250,41 @@ def prepare_slope_limitations(
             raise
         input_file = os.path.join(fabdemdir, filename)
         input_dem = gdal.Open(input_file)
+        
+        # reproject to TM
         if input_dem:
             target_crs = f"+proj=tmerc +lat_0=0 +lon_0={lon} " \
                 f"+k=0.9996 +x_0=500000 +y_0=0 +ellps=WGS84 " \
                 f"+units=m +no_defs +type=crs"
             output_utm = os.path.join(fabdemdir, filename.replace('.tif', '_utm.tif'))
             gdal.Warp(output_utm, input_dem, dstSRS=target_crs)
+            
+            # temp_ds = temp_driver.Create('', 1, 1, 1, gdal.GDT_Byte)
+            # gdal.Warp(temp_ds, input_dem, dstSRS=target_crs)
+            
             pass
+        
+        # Rescaling with improved options
+        rescale_options = gdal.WarpOptions(
+            xRes=10,
+            yRes=10,
+            resampleAlg='bilinear',
+            outputType=gdal.GDT_Float32,  # Specify output data type
+            creationOptions=['COMPRESS=LZW', 'TILED=YES'],  # Compression and tiling
+            multithread=True  # Enable multithreading for better performance
+        )
+        output_rescale = os.path.join(fabdemdir, filename.replace('.tif', '_utm_rescale.tif'))
         input_dem = None
         input_dem = gdal.Open(output_utm)
+        if input_dem is None:
+            print(f"Error: Could not open {output_utm}")
+        else:
+            gdal.Warp(output_rescale, input_dem, options=rescale_options)
+            # gdal.Warp(output_rescale, temp_ds, options=rescale_options)        
         
+        # Calculate slope
+        input_dem = None
+        input_dem = gdal.Open(output_rescale)        
         output_slope = os.path.join(fabdemdir, filename.replace('.tif', '_slope.tif'))
         if input_dem is None:
             print(f"Error: Could not open {os.path.join(fabdemdir, filename)}")
@@ -267,34 +296,21 @@ def prepare_slope_limitations(
                 )
             print(f"Slope calculated and saved to {output_slope}")
             pass
+        
+        # Reclass slope
         output_slope_reclass = os.path.join(fabdemdir, filename.replace('.tif', '_slope_reclass.tif'))
         calc_expression = f"(A>={slope_threshold})*1"
-        # # gdal_calc = os.path.join(current_dir, '.venv', 'Scripts', 'gdal_calc.py')
-        # gdal_calc = os.path.join('.venv', 'Scripts', 'gdal_calc.py')
-        # # gdal_calc = gdal_calc.replace(r'\\\\', '\\')
-        # # gdal_calc = r'.\.venv\Scripts\gdal_calc.py'
-        # command = [
-        #     'python3', 
-        #     gdal_calc,
-        #     "-A", output_slope,
-        #     "--calc", calc_expression,
-        #     "--outfile", output_slope_reclass,
-        #     "--overwrite" # Optional: Overwrite if output_raster exists
-        # ]
-        # subprocess.run(command, check=True)
-        # os.environ["PROJ_LIB"] = r"D:\PROG\HSE\hse_pkp\.venv\Lib\site-packages\osgeo\data\proj"
-        
-        my_var_value = os.environ["PROJ_LIB"]
         ds = gdal_calc.Calc(calc_expression, A=output_slope, outfile=output_slope_reclass, overwrite=True)
         pass
         
+        # Vectorize reclassed slope
         # https://www.google.com/search?q=python+rasterio+polygonize&sca_esv=7550878c098e0420&ei=AqK5aIbtPLqbwPAPxvCE6A8&ved=0ahUKEwiG9ujCqL-PAxW6DRAIHUY4Af0Q4dUDCBA&uact=5&oq=python+rasterio+polygonize&gs_lp=Egxnd3Mtd2l6LXNlcnAiGnB5dGhvbiByYXN0ZXJpbyBwb2x5Z29uaXplMgUQABjvBTIFEAAY7wUyBRAAGO8FSMUYUPQGWMIRcAF4AZABAJgBhwGgAbIEqgEDNy4xuAEDyAEA-AEBmAIIoALCA8ICChAAGLADGNYEGEfCAggQABgHGAgYHsICCBAAGIAEGKIEwgILEAAYgAQYhgMYigXCAgYQABgIGB6YAwCIBgGQBgiSBwE4oAfaFrIHATe4B7kDwgcFMC43LjHIBxM&sclient=gws-wiz-serp
         with rasterio.open(output_slope_reclass) as src:
             image = src.read(1)
             transform = src.transform
             crs = src.crs
             # mask = (image != 0 and image != src.nodata)
-            mask = (image == 1)
+            mask = (image == 1) & (image != src.nodata)
             results = (
                 {'properties': {'raster_val': v}, 'geometry': s}
                 for i, (s, v) in enumerate(
@@ -305,25 +321,24 @@ def prepare_slope_limitations(
             gdf = gpd.GeoDataFrame.from_features(geoms)
             gdf = gdf.set_crs(crs)
             gdf = gdf.to_crs('EPSG:4326')
+            # add current vector data to final geodataframe
             if i == 0:
                 final_gdf = gdf                
             else:
                 final_gdf = pd.concat([final_gdf, gdf], ignore_index=True)
             # gdf.to_file('result/slope_limitations.gpkg', layer=filename.replace('.tif', '_slope'))
-            
         ds = None
         input_dem = None
-        for fl in [output_slope, output_slope_reclass, output_utm, input_file]:
+        # Delete intermediate rasters
+        for fl in [output_slope, output_slope_reclass, output_utm, input_file, output_rescale]:
             try:
                 os.remove(fl)
             except Exception as err:
                 print(err)
-        pass
     if not final_gdf.empty:
+        # Clip result by region and save to output
         final_gdf = final_gdf.clip(region_gdf)
-        final_gdf.to_file('result/slope_limitations.gpkg', layer=region)
-        pass
-        
+        final_gdf.to_file('result/slope_limitations.gpkg', layer=region)        
 
 
 if __name__ == '__main__':
