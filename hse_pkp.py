@@ -1,4 +1,5 @@
 # import shapely
+from urllib.parse import parse_qsl
 import geopandas as gpd
 import pandas as pd
 from pyproj import Geod, crs, Transformer
@@ -12,6 +13,7 @@ import rasterio
 import rasterio.features
 import numpy as np
 from tqdm import tqdm
+import math
 
 # Сложности https://github.com/astral-sh/uv/issues/11466
 from osgeo import gdal
@@ -257,44 +259,47 @@ def prepare_slope_limitations(
         input_file = os.path.join(fabdemdir, filename)
         input_dem = gdal.Open(input_file)
         
-        # reproject to TM
-        if input_dem:
-            # # UTM:
-            # target_crs = f"+proj=tmerc +lat_0=0 +lon_0={lon} " \
-            #     f"+k=0.9996 +x_0=500000 +y_0=0 +ellps=WGS84 " \
-            #     f"+units=m +no_defs +type=crs"
-            # LAEA:
-            target_crs = f"+proj=laea +lat_0={region_centr_lat} +lon_0={ region_centr_lon} " \
-                         f"+x_0=4321000 +y_0=3210000 +ellps=WGS84 +units=m +no_defs"
-            # # LAEA EPSG:3035
-            # target_crs = f"+proj=laea +lat_0=52 +lon_0=10 " \
-            #              f"+x_0=4321000 +y_0=3210000 +ellps=WGS84 +units=m +no_defs"
+        # # reproject       # Перепроецирование в итоге убрали
+        # if input_dem:
+        #     # # UTM:
+        #     # target_crs = f"+proj=tmerc +lat_0=0 +lon_0={lon} " \
+        #     #     f"+k=0.9996 +x_0=500000 +y_0=0 +ellps=WGS84 " \
+        #     #     f"+units=m +no_defs +type=crs"
+        #     # LAEA:
+        #     target_crs = f"+proj=laea +lat_0={region_centr_lat} +lon_0={region_centr_lon} " \
+        #                  f"+x_0=4321000 +y_0=3210000 +ellps=WGS84 +units=m +no_defs"
+        #     # # LAEA EPSG:3035
+        #     # target_crs = f"+proj=laea +lat_0=52 +lon_0=10 " \
+        #     #              f"+x_0=4321000 +y_0=3210000 +ellps=WGS84 +units=m +no_defs"
             
-            output_reproj = os.path.join(fabdemdir, filename.replace('.tif', '_reproj.tif'))
-            gdal.Warp(output_reproj, input_dem, dstSRS=target_crs)
+        #     output_reproj = os.path.join(fabdemdir, filename.replace('.tif', '_reproj.tif'))
+        #     gdal.Warp(output_reproj, input_dem, dstSRS=target_crs)
             
-            # temp_ds = temp_driver.Create('', 1, 1, 1, gdal.GDT_Byte)
-            # gdal.Warp(temp_ds, input_dem, dstSRS=target_crs)
-            input_dem = None
-            input_dem = gdal.Open(output_reproj)
-            pass
+        #     # temp_ds = temp_driver.Create('', 1, 1, 1, gdal.GDT_Byte)
+        #     # gdal.Warp(temp_ds, input_dem, dstSRS=target_crs)
+        #     input_dem = None
+        #     input_dem = gdal.Open(output_reproj)
+        #     pass
         
         # Rescaling with improved options
         output_rescale = None
         if rescale:
             rescale_options = gdal.WarpOptions(
-                xRes=rescale_size,
-                yRes=rescale_size,
+                # xRes=rescale_size,
+                # yRes=rescale_size,
+                xRes=rescale_size / (111320 * math.cos(math.radians(lat))),
+                yRes=rescale_size / (111320 * math.cos(math.radians(lat))),
                 resampleAlg='bilinear',
                 outputType=gdal.GDT_Float32,  # Specify output data type
                 creationOptions=['COMPRESS=LZW', 'TILED=YES'],  # Compression and tiling
                 multithread=True  # Enable multithreading for better performance
             )
-            output_rescale = os.path.join(fabdemdir, filename.replace('.tif', '_utm_rescale.tif'))
-            input_dem = None
-            input_dem = gdal.Open(output_reproj)
+            output_rescale = os.path.join(fabdemdir, filename.replace('.tif', '_reproj_rescale.tif'))
+            # input_dem = None
+            # input_dem = gdal.Open(output_reproj)
             if input_dem is None:
-                print(f"Error: Could not open {output_reproj}")
+                # print(f"Error: Could not open {output_reproj}")
+                pass
             else:
                 gdal.Warp(output_rescale, input_dem, options=rescale_options)
                 input_dem = None
@@ -309,11 +314,17 @@ def prepare_slope_limitations(
             print(f"Error: Could not open {os.path.join(fabdemdir, filename)}")
         else:
             # https://gdal.org/en/stable/api/python/utilities.html#osgeo.gdal.DEMProcessing
+            # далее несколько вариантов расчета вертикального масштаба при вычислении slope, подсказанные GPT-5 (low reasoning)
+            # scale = 1             # Это если в метрах
+            # scale = 111320        # Это если в градусах и без учета широты
+            # scale = 111320 * math.cos(math.radians(lat))      # Это если в градусах и по упрощенной формуле только с учетом масштаба по долготе в зависимости от широты
+            # scale = 111132.954 * math.cos(math.radians(lat))  # Это если в градусах и по упрощенной формуле с учетом масштаба по долготе в зависимости от широты, с уточненным коэффициентом
+            scale = math.sqrt((111132.954 - (559.822 * math.cos(math.radians(2 * lat))) + 1.175 * math.cos(math.radians(4 * lat))) * (111132.954 * math.cos(math.radians(lat))))  # Это если в градусах, по самой точной формуле как среднее геометрическое масштабов по долготе и широте в зависимости от широты
             gdal.DEMProcessing(
-                output_slope, input_dem, "slope", computeEdges=True, slopeFormat="degree"
-                # , scale=111100    # Это если в градусах
+                output_slope, input_dem, "slope", 
+                computeEdges=True, slopeFormat="degree", scale=scale   # Это если в градусах
                 )
-            print(f"Slope calculated and saved to {output_slope}")
+            # print(f"Slope calculated and saved to {output_slope}")
             pass
         
         # Reclass slope
@@ -349,7 +360,13 @@ def prepare_slope_limitations(
         ds = None
         input_dem = None
         # Delete intermediate rasters
-        for fl in [output_slope, output_slope_reclass, output_reproj, input_file, output_rescale]:
+        for fl in [
+            output_slope, 
+            output_slope_reclass, 
+            # output_reproj, 
+            input_file, 
+            output_rescale
+        ]:
             try:
                 os.remove(fl)
             except Exception as err:
