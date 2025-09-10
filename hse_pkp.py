@@ -326,8 +326,6 @@ def prepare_slope_limitations(
         raise
     pass
 
-    # temp_driver = gdal.GetDriverByName('MEM')
-
     current_dir = os.getcwd()
     os.environ["PROJ_LIB"] = os.path.join(current_dir, '.venv', 'Lib', 'site-packages', 'osgeo', 'data', 'proj')
     fabdemdir = os.path.join(current_dir, 'fabdem')
@@ -507,8 +505,9 @@ def prepare_wetlands_limitations(
         if region_buf_size > 0:
             region_buffer = calculate_geod_buffers(region_gdf, 'laea', 'value', region_buf_size, geom_field='geom')
             region_gdf = region_gdf.set_geometry(region_buffer)
-        sql = f"select * from {wetlands_table} wtlnd where ST_Intersects((select geom from {regions_table} where lower(region) = '{region.lower()}' limit 1), wtlnd.geom);"
+        sql = f"select * from {wetlands_table} wtlnd where ST_Intersects((select ST_Buffer(geom::geography, {region_buf_size})::geometry from {regions_table} where lower(region) = '{region.lower()}' limit 1), wtlnd.geom);"
         wetlands_gdf = gpd.read_postgis(sql, engine)
+        pass
     except:
         raise
     region_shortname = get_region_shortname(region)
@@ -539,7 +538,7 @@ if __name__ == '__main__':
 
     prepare_wetlands_limitations(
         region='Липецкая область',
-        region_buf_size=0,
+        region_buf_size=5000,
     )
         
     
