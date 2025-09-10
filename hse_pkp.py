@@ -480,6 +480,46 @@ def prepare_slope_limitations(
             )        
 
 
+def prepare_wetlands_limitations(
+    region='', 
+    regions_table='admin.hse_russia_regions', 
+    wetlands_table='osm.osm_wetlands_russia_final',
+    region_buf_size=0,
+):
+    try:
+        with open('.secret/.gdcdb', encoding='utf-8') as f:
+            pg = json.load(f)
+    except:
+        raise
+    try:
+        engine = sqlalchemy.create_engine(
+            f"postgresql+psycopg2://{pg['user']}:{pg['password']}@{pg['host']}:{pg['port']}/{pg['database']}",
+            connect_args={
+                "sslmode": "verify-full",
+                "target_session_attrs": "read-write"
+            },
+        )
+    except:
+        raise
+    try:
+        sql = f"select * from {regions_table} where lower(region) = '{region.lower()}';"
+        region_gdf = gpd.read_postgis(sql, engine)
+        if region_buf_size > 0:
+            region_buffer = calculate_geod_buffers(region_gdf, 'laea', 'value', region_buf_size, geom_field='geom')
+            region_gdf = region_gdf.set_geometry(region_buffer)
+        sql = f"select * from {wetlands_table} wtlnd where ST_Intersects((select geom from {regions_table} where lower(region) = '{region.lower()}' limit 1), wtlnd.geom);"
+        wetlands_gdf = gpd.read_postgis(sql, engine)
+    except:
+        raise
+    region_shortname = get_region_shortname(region)
+    wetlands_gdf = wetlands_gdf.clip(region_gdf)
+    wetlands_gdf.to_file(
+        'result/wetlands_limitations.gpkg', 
+        layer=f"{region_shortname}_wetlands"
+        )
+    
+    
+
 if __name__ == '__main__':
     # prepare_water_limitations(
     #     source_water_line='data/Lipetsk_water_lines_3857/Lipetsk_water_lines_3857.shp',
@@ -489,11 +529,17 @@ if __name__ == '__main__':
     #     buffer_crs = 'utm'
     #     )
     
-    prepare_slope_limitations(
+    # prepare_slope_limitations(
+    #     region='Липецкая область',
+    #     slope_threshold=12,
+    #     fabdem_zip_path=r"\\172.21.204.20\geodata\_PROJECTS\pkp\vm0047_prod\dem_fabdem",
+    #     rescale=True,
+    #     rescale_size=10
+    # )
+
+    prepare_wetlands_limitations(
         region='Липецкая область',
-        slope_threshold=12,
-        fabdem_zip_path=r"\\172.21.204.20\geodata\_PROJECTS\pkp\vm0047_prod\dem_fabdem",
-        rescale=True,
-        rescale_size=10
+        region_buf_size=0,
     )
+        
     
