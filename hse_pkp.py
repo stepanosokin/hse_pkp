@@ -1,4 +1,5 @@
 # import shapely
+from tkinter.constants import Y
 from urllib.parse import parse_qsl
 import geopandas as gpd
 import pandas as pd
@@ -21,11 +22,103 @@ from osgeo import gdal_array
 from osgeo_utils import gdal_calc
 
 
+def get_region_shortname(region):
+    regions_dict = {
+        "Алтайский край": "Altayskiy",
+        "Амурская область": "Amurskaya",
+        "Архангельская область": "Arkhangelskaya",
+        "Астраханская область": "Astrakhanskaya",
+        "Белгородская область": "Belgorodskaya",
+        "Брянская область": "Bryanskaya",
+        "Владимирская область": "Vladimirskaya",
+        "Волгоградская область": "Volgogradskaya",
+        "Вологодская область": "Vologodskaya",
+        "Воронежская область": "Voronezhskaya",
+        "г. Москва": "Moskva",
+        "г. Санкт-Петербург": "Sankt-Peterburg",
+        "г. Севастополь": "Sevastopol",
+        "Еврейская автономная область": "Evreyskaya",
+        "Забайкальский край": "Zabaykalskiy",
+        "Ивановская область": "Ivanovskaya",
+        "Иркутская область": "Irkutskaya",
+        "Кабардино-Балкарская Республика": "Kabardino-Balkariya",
+        "Калининградская область": "Kaliningradskaya",
+        "Калужская область": "Kaluzhskaya",
+        "Камчатский край": "Kamchatskiy",
+        "Карачаево-Черкесская Республика": "Karachaevo-Cherkessiya",
+        "Кировская область": "Kirovskaya",
+        "Костромская область": "Kostromskaya",
+        "Краснодарский край": "Krasnodarskiy",
+        "Красноярский край": "Krasnoyarskiy",
+        "Курганская область": "Kurganskaya",
+        "Курская область": "Kurskaya",
+        "Ленинградская область": "Leningradskaya",
+        "Липецкая область": "Lipetskaya",
+        "Магаданская область": "Magadanskaya",
+        "Московская область": "Moskovskaya",
+        "Мурманская область": "Murmanskaya",
+        "Ненецкий автономный округ": "Nenetskiy",
+        "Нижегородская область": "Nizhegorodskaya",
+        "Новгородская область": "Novgorodskaya",
+        "Новосибирская область": "Novosibirskaya",
+        "Омская область": "Omskaya",
+        "Оренбургская область": "Orenburgskaya",
+        "Орловская область": "Orlovskaya",
+        "Пензенская область": "Penzenskaya",
+        "Пермский край": "Permskiy",
+        "Приморский край": "Primorskiy",
+        "Псковская область": "Pskovskaya",
+        "Республика Алтай": "Altay",
+        "Республика Башкортостан": "Bashkortostan",
+        "Республика Бурятия": "Buryatiya",
+        "Республика Дагестан": "Dagestan",
+        "Республика Ингушетия": "Ingushetiya",
+        "Республика Калмыкия": "Kalmykiya",
+        "Республика Карелия": "Kareliya",
+        "Республика Коми": "Komi",
+        "Республика Крым": "Krym",
+        "Республика Марий Эл": "Mariy-El",
+        "Республика Мордовия": "Mordoviya",
+        "Республика Саха (Якутия)": "Sakha",
+        "Республика Северная Осетия": "Severnaya Osetiya",
+        "Республика Тыва": "Tyva",
+        "Республика Хакассия": "Khakassiya",
+        "Ростовская область": "Rostovskaya",
+        "Рязанская область": "Ryazanskaya",
+        "Самарская область": "Samarskaya",
+        "Саратовская область": "Saratovskaya",
+        "Сахалинская область": "Sakhalinskaya",
+        "Свердловская область": "Sverdlovskaya",
+        "Смоленская область": "Smolenskaya",
+        "Ставропольский край": "Stavropolskiy",
+        "Тамбовская область": "Tambovskaya",
+        "Тверская область": "Tverskaya",
+        "Томская область": "Tomskaya",
+        "Тульская область": "Tulskaya",
+        "Тюменская область": "Tyumenskaya",
+        "Удмуртская Республика": "Udmurtskaya",
+        "Ульяновская область": "Ulyanovskaya",
+        "Хабаровский край": "Khabarovskiy",
+        "Челябинская область": "Chelyabinskaya",
+        "Чеченская Республика": "Chechenskaya",
+        "Чукотский автономный округ": "Chukotskiy",
+        "Ямало-Ненецкий автономный округ": "Yamalo-Nenetskiy",
+        "Ярославская область": "Yaroslavskaya",
+        "Ханты-Мансийский автономный округ - Югра": "Ugra",
+        "Кемеровская область - Кузбасс": "Kuzbass",
+        "Республика Адыгея (Адыгея)": "Adygeya",
+        "Республика Татарстан (Татарстан)": "Tatarstan",
+        "Чувашская Республика - Чувашия": "Chuvashiya"
+    }
+    return regions_dict.get(region, None)
+
+
 def calculate_geod_buffers(
     i_gdf: gpd.GeoDataFrame,
     buffer_crs: str,
     buffer_dist_source: str,
-    buffer_distance
+    buffer_distance,
+    geom_field='geometry'
 ):
     """_summary_
 
@@ -45,8 +138,8 @@ def calculate_geod_buffers(
     buffer_geom = []
     for i, row in i_gdf.iterrows():   # итерация по линейным объектам
         # формирование проекции UTM с центральным меридианом в центроиде текущего объекта
-        lon = row['geometry'].centroid.x
-        lat = row['geometry'].centroid.y
+        lon = row[geom_field].centroid.x
+        lat = row[geom_field].centroid.y
         if buffer_crs == 'utm':
             buf_crs = crs.CRS.from_proj4(
                 f"+proj=tmerc +lat_0=0 +lon_0={lon} " \
@@ -65,9 +158,9 @@ def calculate_geod_buffers(
         transformer2 = Transformer.from_crs(buf_crs, 4326, always_xy=True)
         # вычисление буфера в текущей проекции UTM
         if buffer_dist_source == 'value':
-            buffer = shapely.buffer(shapely.transform(row['geometry'], transformer1.transform, interleaved=False), float(buffer_distance))
+            buffer = shapely.buffer(shapely.transform(row[geom_field], transformer1.transform, interleaved=False), float(buffer_distance))
         elif buffer_dist_source == 'field':
-            buffer = shapely.buffer(shapely.transform(row['geometry'], transformer1.transform, interleaved=False), float(row[buffer_distance]))
+            buffer = shapely.buffer(shapely.transform(row[geom_field], transformer1.transform, interleaved=False), float(row[buffer_distance]))
         else:
             raise ValueError("Неверно задан параметр buffer_dist_source")
         # Пересчет буфера обратно в WGS-1984
@@ -196,6 +289,7 @@ def prepare_slope_limitations(
     region='', 
     slope_threshold = 12,
     regions_table='admin.hse_russia_regions', 
+    region_buf_size=5000,
     fabdem_tiles_table='elevation.fabdem_v1_2_tiles',
     fabdem_zip_path=r"\\172.21.204.20\geodata\_PROJECTS\pkp\vm0047_prod\dem_fabdem",
     rescale=True,
@@ -224,6 +318,8 @@ def prepare_slope_limitations(
     try:
         sql = f"select * from {regions_table} where lower(region) = '{region.lower()}';"
         region_gdf = gpd.read_postgis(sql, engine)
+        region_buffer = calculate_geod_buffers(region_gdf, 'laea', 'value', region_buf_size, geom_field='geom')
+        region_gdf = region_gdf.set_geometry(region_buffer)
         sql = f"select * from {fabdem_tiles_table} fbdm where ST_Intersects((select geom from {regions_table} where lower(region) = '{region.lower()}' limit 1), fbdm.geom);"
         tiles_gdf = gpd.read_postgis(sql, engine)
     except:
@@ -287,14 +383,17 @@ def prepare_slope_limitations(
             rescale_options = gdal.WarpOptions(
                 # xRes=rescale_size,
                 # yRes=rescale_size,
-                xRes=rescale_size / (111320 * math.cos(math.radians(lat))),
-                yRes=rescale_size / (111320 * math.cos(math.radians(lat))),
+                # xRes=rescale_size / (111320 * math.cos(math.radians(lat))),
+                # yRes=rescale_size / (111320 * math.cos(math.radians(lat))),
+                xRes=rescale_size / math.sqrt((111132.954 - (559.822 * math.cos(math.radians(2 * lat))) + 1.175 * math.cos(math.radians(4 * lat))) * (111132.954 * math.cos(math.radians(lat)))),
+                yRes=rescale_size / math.sqrt((111132.954 - (559.822 * math.cos(math.radians(2 * lat))) + 1.175 * math.cos(math.radians(4 * lat))) * (111132.954 * math.cos(math.radians(lat)))),
                 resampleAlg='bilinear',
                 outputType=gdal.GDT_Float32,  # Specify output data type
                 creationOptions=['COMPRESS=LZW', 'TILED=YES'],  # Compression and tiling
                 multithread=True  # Enable multithreading for better performance
             )
             output_rescale = os.path.join(fabdemdir, filename.replace('.tif', '_reproj_rescale.tif'))
+            # раскомментить если нужно перепроецировать
             # input_dem = None
             # input_dem = gdal.Open(output_reproj)
             if input_dem is None:
@@ -374,7 +473,11 @@ def prepare_slope_limitations(
     if not final_gdf.empty:
         # Clip result by region and save to output
         final_gdf = final_gdf.clip(region_gdf)
-        final_gdf.to_file('result/slope_limitations.gpkg', layer=region)        
+        region_shortname = get_region_shortname(region)
+        final_gdf.to_file(
+            'result/slope_limitations.gpkg', 
+            layer=f"{region_shortname}_{str(rescale_size)}m_sl_more_{str(slope_threshold)}_vector"
+            )        
 
 
 if __name__ == '__main__':
