@@ -516,6 +516,49 @@ def prepare_wetlands_limitations(
         'result/wetlands_limitations.gpkg', 
         layer=f"{region_shortname}_wetlands"
         )
+
+
+def prepare_soil_limitations(
+    region='', 
+    regions_table='admin.hse_russia_regions', 
+    soil_table='egrpr_esoil_ru.soil_map_m2_5_v',
+    region_buf_size=0,
+):
+    try:
+        with open('.secret/.gdcdb', encoding='utf-8') as f:
+            pg = json.load(f)
+    except:
+        raise
+    try:
+        engine = sqlalchemy.create_engine(
+            f"postgresql+psycopg2://{pg['user']}:{pg['password']}@{pg['host']}:{pg['port']}/{pg['database']}",
+            connect_args={
+                "sslmode": "verify-full",
+                "target_session_attrs": "read-write"
+            },
+        )
+    except:
+        raise
+    try:
+        sql = f"select * from {regions_table} where lower(region) = '{region.lower()}';"
+        region_gdf = gpd.read_postgis(sql, engine)
+        if region_buf_size > 0:
+            region_buffer = calculate_geod_buffers(region_gdf, 'laea', 'value', region_buf_size, geom_field='geom')
+            region_gdf = region_gdf.set_geometry(region_buffer)
+        sql = f"select * from {soil_table} sl " \
+              f"where ST_Intersects((select ST_Buffer(geom::geography, {region_buf_size})::geometry from {regions_table} where lower(region) = '{region.lower()}' limit 1), sl.geom) " \
+              f"and sl.soil0 between 163 and 171;"
+        soil_gdf = gpd.read_postgis(sql, engine)
+        pass
+    except:
+        raise
+    if not soil_gdf.empty:
+        region_shortname = get_region_shortname(region)
+        soil_gdf = soil_gdf.clip(region_gdf)
+        soil_gdf.to_file(
+            'result/soil_limitations.gpkg', 
+            layer=f"{region_shortname}_soil"
+        )
     
     
 
@@ -536,7 +579,12 @@ if __name__ == '__main__':
     #     rescale_size=10
     # )
 
-    prepare_wetlands_limitations(
+    # prepare_wetlands_limitations(
+    #     region='Липецкая область',
+    #     region_buf_size=5000,
+    # )
+
+    prepare_soil_limitations(
         region='Липецкая область',
         region_buf_size=5000,
     )
