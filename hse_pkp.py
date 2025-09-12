@@ -559,8 +559,84 @@ def prepare_soil_limitations(
             'result/soil_limitations.gpkg', 
             layer=f"{region_shortname}_soil"
         )
+
+
+def prepare_settlements_limitations(
+    region='', 
+    regions_table='admin.hse_russia_regions',
+    nspd_table='nspd.nspd_settlements_pol',
+    osm_table='osm.gis_osm_places_a_free',
+    region_buf_size=0,
+):
+    try:
+        with open('.secret/.gdcdb', encoding='utf-8') as f:
+            pg = json.load(f)
+    except:
+        raise
+    try:
+        engine = sqlalchemy.create_engine(
+            f"postgresql+psycopg2://{pg['user']}:{pg['password']}@{pg['host']}:{pg['port']}/{pg['database']}",
+            connect_args={
+                "sslmode": "verify-full",
+                "target_session_attrs": "read-write"
+            },
+        )
+    except:
+        raise
+    try:
+        sql = f"select * from {regions_table} where lower(region) = '{region.lower()}';"
+        region_gdf = gpd.read_postgis(sql, engine)
+        if region_buf_size > 0:
+            region_buffer = calculate_geod_buffers(region_gdf, 'laea', 'value', region_buf_size, geom_field='geom')
+            region_gdf = region_gdf.set_geometry(region_buffer)
+        sql = f"select * from {nspd_table} nspd " \
+              f"where ST_Intersects(" \
+              f"(select ST_Buffer(geom::geography, {region_buf_size})::geometry from {regions_table} where lower(region) = '{region.lower()}' limit 1), " \
+              f"ST_Transform(nspd.geom, 4326)" \
+              f");"
+        nspd_gdf = gpd.read_postgis(sql, engine)
+        nspd_gdf = nspd_gdf.to_crs('EPSG:4326')
+        sql = f"select * from {osm_table} osm " \
+              f"where ST_Intersects(" \
+              f"(select ST_Buffer(geom::geography, {region_buf_size})::geometry from {regions_table} where lower(region) = '{region.lower()}' limit 1), " \
+              f"osm.geom" \
+              f") " \
+              f"and fclass not in ('county', 'region', 'island');"
+        osm_gdf = gpd.read_postgis(sql, engine)
+    except:
+        raise
     
-    
+    # выбрать только те объекты из OSM, которые не пересекают объекты из NSPD
+    tmp = gpd.sjoin(osm_gdf, nspd_gdf[['geom']], how='left', predicate='intersects')
+    osm_gdf = tmp[tmp.index_right.isna()].drop(columns=['index_right']).copy()
+
+    # Unify column set
+    all_cols = list(set(osm_gdf.columns) | set(nspd_gdf.columns))
+
+    # Add missing columns with NA
+    for g in (osm_gdf, nspd_gdf):
+        missing = [c for c in all_cols if c not in g.columns]
+        for c in missing:
+            g[c] = pd.NA
+
+    # Optional: keep track of source
+    osm_gdf['source'] = 'osm'
+    nspd_gdf['source'] = 'nspd'
+
+    # Concatenate
+    settlements_gdf = gpd.GeoDataFrame(
+        pd.concat([osm_gdf[all_cols], nspd_gdf[all_cols]], ignore_index=True),
+        geometry='geom',  # or osm_gdf.geometry.name
+        crs=osm_gdf.crs
+    )
+
+    if not settlements_gdf.empty:
+        region_shortname = get_region_shortname(region)
+        settlements_gdf = settlements_gdf.clip(region_gdf)
+        settlements_gdf.to_file(
+            'result/poppol_limitations.gpkg', 
+            layer=f"poppol_merge_{region_shortname}"
+        )
 
 if __name__ == '__main__':
     # prepare_water_limitations(
@@ -584,9 +660,12 @@ if __name__ == '__main__':
     #     region_buf_size=5000,
     # )
 
-    prepare_soil_limitations(
-        region='Липецкая область',
-        region_buf_size=5000,
+    # prepare_soil_limitations(
+    #     region='Липецкая область',
+    #     region_buf_size=5000,
+    # )
+
+    prepare_settlements_limitations(
+        region='Калужская область'
     )
         
-    
