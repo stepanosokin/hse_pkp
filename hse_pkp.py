@@ -638,6 +638,54 @@ def prepare_settlements_limitations(
             layer=f"poppol_merge_{region_shortname}"
         )
 
+
+def prepare_oopt_limitations(
+    region='', 
+    regions_table='admin.hse_russia_regions', 
+    oopt_table='ecology.pkp_oopt_russia_2024',
+    region_buf_size=0,
+):
+    try:
+        with open('.secret/.gdcdb', encoding='utf-8') as f:
+            pg = json.load(f)
+    except:
+        raise
+    try:
+        engine = sqlalchemy.create_engine(
+            f"postgresql+psycopg2://{pg['user']}:{pg['password']}@{pg['host']}:{pg['port']}/{pg['database']}",
+            connect_args={
+                "sslmode": "verify-full",
+                "target_session_attrs": "read-write"
+            },
+        )
+    except:
+        raise
+    try:
+        sql = f"select * from {regions_table} where lower(region) = '{region.lower()}';"
+        region_gdf = gpd.read_postgis(sql, engine)
+        if region_buf_size > 0:
+            region_buffer = calculate_geod_buffers(region_gdf, 'laea', 'value', region_buf_size, geom_field='geom')
+            region_gdf = region_gdf.set_geometry(region_buffer)
+        sql = f"select * from {oopt_table} oopt " \
+            f"where ST_Intersects(" \
+            f"(select ST_Buffer(geom::geography, {region_buf_size})::geometry from {regions_table} where lower(region) = '{region.lower()}' limit 1), " \
+            f"oopt.geom" \
+            f") " \
+            f"and oopt.name !~* 'охотнич' " \
+            f"and oopt.actuality ~* 'действующ';"
+        oopt_gdf = gpd.read_postgis(sql, engine)
+        pass
+    except:
+        raise
+    if not oopt_gdf.empty:
+        region_shortname = get_region_shortname(region)
+        oopt_gdf = oopt_gdf.clip(region_gdf)
+        oopt_gdf.to_file(
+            'result/oopt_limitations.gpkg', 
+            layer=f"{region_shortname}_oopt"
+        )
+
+
 if __name__ == '__main__':
     # prepare_water_limitations(
     #     source_water_line='data/Lipetsk_water_lines_3857/Lipetsk_water_lines_3857.shp',
@@ -665,7 +713,11 @@ if __name__ == '__main__':
     #     region_buf_size=5000,
     # )
 
-    prepare_settlements_limitations(
-        region='Калужская область'
+    # prepare_settlements_limitations(
+    #     region='Калужская область'
+    # )
+
+    prepare_oopt_limitations(
+        region='Липецкая область'
     )
         
