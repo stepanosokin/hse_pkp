@@ -118,7 +118,7 @@ def calculate_geod_buffers(
     buffer_crs: str,
     buffer_dist_source: str,
     buffer_distance,
-    geom_field='geometry'
+    geom_field='geom'
 ):
     """_summary_
 
@@ -171,11 +171,18 @@ def calculate_geod_buffers(
 
 
 def prepare_water_limitations(
-    source_water_line='data/water_line.shp',
-    source_water_pol='data/water_pol.shp',
-    result_gpkg='result/water_limitations.gpkg',
+    postgres_info='.secret/.gdcdb',
+    region='Липецкая область',
+    # source_water_line='data/water_line.shp',
+    water_line_table='osm.gis_osm_waterways_free',
+    water_pol_table='osm.gis_osm_water_a_free',
+    regions_table='admin.hse_russia_regions',
+    region_buf_size=0,
+    # source_water_pol='data/water_pol.shp',
+    # result_gpkg='result/water_limitations.gpkg',
     buffer_distance = 5,
-    buffer_crs = 'utm'
+    buffer_crs = 'utm',
+    geometry_field='geom'
 ):
     """Функция рассчитывает ограничения для проекта ПКП для линейных и площадных водных объектов по методике Жанны. 
     Документация дорабатывается.
@@ -187,31 +194,75 @@ def prepare_water_limitations(
         buffer_distance (int, optional): расстояние первого буфера от линейных объектов в м. Будет рассчитан в UTM с осевым меридианом в центроиде объекта или в LAEA с центром в центроиде объекта. Defaults to 5.
         buffer_crs (str, optional): проекция для расчета буферов. 'utm' или 'laea'. Defaults to 'utm'.
     """
+    # try:
+    #     gdf_l = gpd.read_file(source_water_line)
+    #     gdf_p = gpd.read_file(source_water_pol)
+    # except:
+    #     raise
+    
+    ###################################################################
+
     try:
-        gdf_l = gpd.read_file(source_water_line)
-        gdf_p = gpd.read_file(source_water_pol)
+        with open(postgres_info, encoding='utf-8') as f:
+            pg = json.load(f)
     except:
         raise
+    try:
+        engine = sqlalchemy.create_engine(
+            f"postgresql+psycopg2://{pg['user']}:{pg['password']}@{pg['host']}:{pg['port']}/{pg['database']}",
+            connect_args={
+                "sslmode": "verify-full",
+                "target_session_attrs": "read-write"
+                # "sslcert": "/path/to/client.crt",
+                # "sslkey": "/path/to/client.key",
+                # "sslrootcert": "/path/to/ca.crt",
+            },
+        )
+        pass
+    except:
+        raise
+    try:
+        sql = f"select * from {regions_table} where lower(region) = '{region.lower()}';"
+        region_gdf = gpd.read_postgis(sql, engine)
+        if region_buf_size > 0:
+            region_buffer = calculate_geod_buffers(region_gdf, 'laea', 'value', region_buf_size, geom_field='geom')
+            region_gdf = region_gdf.set_geometry(region_buffer)
+        sql = f"select * from {water_line_table} wl " \
+            f"where ST_Intersects(" \
+            f"(select ST_Buffer(geom::geography, {region_buf_size})::geometry from {regions_table} where lower(region) = '{region.lower()}' limit 1), " \
+            f"wl.geom" \
+            f");"
+        gdf_l = gpd.read_postgis(sql, engine)
+        sql = f"select * from {water_pol_table} wp " \
+            f"where ST_Intersects(" \
+            f"(select ST_Buffer(geom::geography, {region_buf_size})::geometry from {regions_table} where lower(region) = '{region.lower()}' limit 1), " \
+            f"wp.geom" \
+            f");"
+        gdf_p = gpd.read_postgis(sql, engine)
+    except:
+        raise
+
+    ######################################
     
     # сливаем геометрию по полям fclass и name
     gdf_l = gdf_l.dissolve(by=['fclass', 'name'], dropna=False)
     
     # Объединяем куски полилиний
-    gdf_l['geometry'] = gdf_l['geometry'].line_merge()
+    gdf_l[geometry_field] = gdf_l[geometry_field].line_merge()
     
     # пересчитать в WGS-84 для вычисления геодезических расстояний
     gdf_l = gdf_l.to_crs(4326)
     
     # рассчитать геодезические длины
     geod = Geod(ellps='WGS84')
-    gdf_l['leng'] = [geod.geometry_length(row['geometry']) for i, row in gdf_l.iterrows()]    
+    gdf_l['leng'] = [geod.geometry_length(row[geometry_field]) for i, row in gdf_l.iterrows()]    
     # gdf.to_file(result_gpkg, layer='water_line_dissolved')
 
     # разбить мульти полилинии на отдельные
     gdf_l = gdf_l.explode()
     
     # рассчитать геодезические длины после разбивки на отдельные линии
-    gdf_l['leng'] = [geod.geometry_length(row['geometry']) for i, row in gdf_l.iterrows()]    
+    gdf_l['leng'] = [geod.geometry_length(row[geometry_field]) for i, row in gdf_l.iterrows()]    
     # gdf.to_file(result_gpkg, layer='water_line_dissolved_exploded')
     
     # отфильтровать ручьи и каналы короче 10 км
@@ -219,7 +270,7 @@ def prepare_water_limitations(
     # gdf_l.to_file(result_gpkg, layer='water_line_dissolved_exploded_filtered')
     
     # Расчет буферов вокруг линейных водных объектов
-    buffer_geom = calculate_geod_buffers(gdf_l, buffer_crs, 'value', buffer_distance)
+    buffer_geom = calculate_geod_buffers(gdf_l, buffer_crs, 'value', buffer_distance, geom_field='geom')
     
     # gdf_l['buffer_geometry'] = buffer_geom
     gdf_l_buffered = gdf_l.set_geometry(buffer_geom)
@@ -230,9 +281,10 @@ def prepare_water_limitations(
     gdf_l_buffered['buf'] = [50 if x <= 10000 else 100 if 10000 < x <= 50000 else 200 for x in gdf_l_buffered['leng']]
     gdf_l['buf'] = [50 if x <= 10 else 100 if 10000 < x <= 50000 else 200 for x in gdf_l['leng']]
     # gdf_l.to_file(result_gpkg, layer='water_lines_buf')
+    water_lines_buf = gdf_l_buffered.copy()
     # вычислить геодезические буферы по полю buf  
-    buffer_geom = calculate_geod_buffers(gdf_l_buffered, buffer_crs, 'field', 'buf')
-    wp2 = gdf_l_buffered.set_geometry(buffer_geom)
+    buffer_geom = calculate_geod_buffers(gdf_l_buffered, buffer_crs, 'field', 'buf', geom_field='geom')
+    wp2 = gdf_l_buffered.set_geometry(buffer_geom)  
     # wp2.to_file(result_gpkg, layer='wp2')
     
     # ---------------------------------------
@@ -242,11 +294,12 @@ def prepare_water_limitations(
     gdf_p = gdf_p.to_crs(4326)
     # убрать все wetland
     gdf_p = gdf_p.query('not fclass in("wetland")')
+    water_poly = gdf_p.copy()
     
     # Вычисление "длин" площадных объектов
     # Сделать пространственное присоединение обработанных линейных объектов по пересечению
     gdf_l = gdf_l.clip(gdf_p)
-    gdf_l['leng'] = [geod.geometry_length(row['geometry']) for i, row in gdf_l.iterrows()]
+    gdf_l['leng'] = [geod.geometry_length(row[geometry_field]) for i, row in gdf_l.iterrows()]
     # gdf_l.to_file(result_gpkg, layer='water_lines_clipped')
     gdf_p = gdf_p.sjoin(gdf_l, how='left')
     # Отсортировать результат по длине присоединенного объекта по убыванию
@@ -261,7 +314,7 @@ def prepare_water_limitations(
     gdf_p = gdf_p.rename(columns=new_column_names)
     
     # Вычислить геодезические площади
-    gdf_p['area_km'] = [abs(geod.geometry_area_perimeter(row['geometry'])[0]) / 1000000 for i, row in gdf_p.iterrows()]
+    gdf_p['area_km'] = [abs(geod.geometry_area_perimeter(row[geometry_field])[0]) / 1000000 for i, row in gdf_p.iterrows()]
     
     # Там где не присоединилась длина линейного объекта и площадь больше 0.5, вставить buf=50
     gdf_p['buf'] = [50 if all([x >= 0.5, y]) else z for x, y, z in zip(gdf_p['area_km'], gdf_p['leng'].isna(), gdf_p['buf'])]
@@ -278,14 +331,20 @@ def prepare_water_limitations(
     # wp1_wp2.to_file('result/water_line.gpkg', layer='wp1_wp2')
     water_prot_zone = wp1_wp2.union_all()
     water_prot_zone = gpd.GeoDataFrame(gpd.GeoSeries(water_prot_zone))
-    water_prot_zone = water_prot_zone.rename(columns={0:'geometry'}).set_geometry('geometry')
+    water_prot_zone = water_prot_zone.rename(columns={0:geometry_field}).set_geometry(geometry_field)
     water_prot_zone = water_prot_zone.set_crs('epsg:4326')
     water_prot_zone = water_prot_zone.explode()
+
+    region_shortname = get_region_shortname(region)
     
-    water_prot_zone.to_file(result_gpkg, layer='water_prot_zone')
+    # water_prot_zone.to_file(result_gpkg, layer='water_prot_zone')
+    water_prot_zone.to_file(f"result/{region_shortname}_limitations.gpkg", layer='water_prot_zone')
+
+    return (water_poly, water_lines_buf, water_prot_zone)
 
 
 def prepare_slope_limitations(
+    postgres_info='.secret/.gdcdb',
     region='', 
     slope_threshold = 12,
     regions_table='admin.hse_russia_regions', 
@@ -295,9 +354,48 @@ def prepare_slope_limitations(
     rescale=True,
     rescale_size=10
     ):
-    
+    """Формирует ограничения по уклонам рельефа для указанного региона на основе тайлов DEM FABDEM.
+
+    Процедура выполняет следующие основные шаги:
+    - извлекает границу региона из PostGIS и (опционально) расширяет её на заданное расстояние;
+    - определяет список покрывающих регион тайлов FABDEM из служебной таблицы;
+    - для каждого тайла: извлекает rasters из ZIP, (опционально) изменяет разрешение, вычисляет растр уклонов (в градусах),
+      реклассифицирует по порогу `slope_threshold` и векторизует пиксели, удовлетворяющие условию (>= порога);
+    - объединяет результаты по всем тайлам, обрезает по границе региона и сохраняет в GeoPackage слоя ограничений.
+
+    Аргументы:
+    - postgres_info (str): Путь к JSON-файлу с параметрами подключения к Postgres (`user`, `password`, `host`, `port`, `database`). По умолчанию '.secret/.gdcdb'.
+    - region (str): Название региона в точном соответствии с атрибутом `region` в таблице `regions_table`.
+    - slope_threshold (int | float): Порог уклона (в градусах). Пиксели с уклоном >= порога попадают в ограничения. По умолчанию 12.
+    - regions_table (str): Полное имя таблицы PostGIS с границами регионов. По умолчанию 'admin.hse_russia_regions'.
+    - region_buf_size (int): Радиус буфера (в метрах) вокруг региона для отбора тайлов DEM. 0 — без буфера. По умолчанию 5000.
+    - fabdem_tiles_table (str): Таблица PostGIS со списком тайлов FABDEM и их геометриями/именами файлов.
+    - fabdem_zip_path (str): Путь к каталогу с ZIP-архивами тайлов FABDEM.
+    - rescale (bool): Признак изменения пространственного разрешения входных растров перед расчётом уклона. По умолчанию True.
+    - rescale_size (int | float): Целевое размерение пикселя в метрах при рескейле. По умолчанию 10.
+
+    Возвращает:
+    - geopandas.GeoDataFrame | None: Векторный слой полигонов зон с уклонами >= `slope_threshold`,
+      приведённый к CRS EPSG:4326 и обрезанный по региону. Если подходящих зон нет, возвращает None.
+
+    Побочные эффекты:
+    - Читает файл настроек подключения к БД, указанный в `postgres_info` (по умолчанию '.secret/.gdcdb').
+    - Создаёт временную папку `fabdem/` в текущем рабочем каталоге и временные растровые файлы (которые затем удаляются).
+    - Сохраняет итоговый слой в GeoPackage `result/{region_shortname}_limitations.gpkg` с именем слоя
+      `{region_shortname}_{rescale_size}m_sl_more_{slope_threshold}_vector`.
+
+    Примечания по реализации:
+    - Расчёт уклона выполняется через `gdal.DEMProcessing` в градусах. Масштаб по осям рассчитывается с учётом широты тайла,
+      чтобы корректно интерпретировать растры, заданные в градусах.
+    - Если `rescale=True`, изменение разрешения делается через `gdal.Warp` с билинейной интерполяцией и компрессией LZW.
+    - Все промежуточные растры по каждому тайлу удаляются по завершении обработки тайла.
+
+    Исключения:
+    - Любые ошибки чтения БД/файлов или обработки растров пробрасываются наверх, чтобы вызывающая сторона могла их обработать.
+    """
+
     try:
-        with open('.secret/.gdcdb', encoding='utf-8') as f:
+        with open(postgres_info, encoding='utf-8') as f:
             pg = json.load(f)
     except:
         raise
@@ -473,19 +571,24 @@ def prepare_slope_limitations(
         final_gdf = final_gdf.clip(region_gdf)
         region_shortname = get_region_shortname(region)
         final_gdf.to_file(
-            'result/slope_limitations.gpkg', 
+            # 'result/slope_limitations.gpkg', 
+            f"result/{region_shortname}_limitations.gpkg", 
             layer=f"{region_shortname}_{str(rescale_size)}m_sl_more_{str(slope_threshold)}_vector"
-            )        
+            )
+        
+        return final_gdf
+    return None
 
 
 def prepare_wetlands_limitations(
+    postgres_info='.secret/.gdcdb',
     region='', 
     regions_table='admin.hse_russia_regions', 
     wetlands_table='osm.osm_wetlands_russia_final',
     region_buf_size=0,
 ):
     try:
-        with open('.secret/.gdcdb', encoding='utf-8') as f:
+        with open(postgres_info, encoding='utf-8') as f:
             pg = json.load(f)
     except:
         raise
@@ -513,19 +616,22 @@ def prepare_wetlands_limitations(
     region_shortname = get_region_shortname(region)
     wetlands_gdf = wetlands_gdf.clip(region_gdf)
     wetlands_gdf.to_file(
-        'result/wetlands_limitations.gpkg', 
+        # 'result/wetlands_limitations.gpkg', 
+        f"result/{region_shortname}_limitations.gpkg", 
         layer=f"{region_shortname}_wetlands"
         )
+    return wetlands_gdf
 
 
 def prepare_soil_limitations(
+    postgres_info='.secret/.gdcdb',
     region='', 
     regions_table='admin.hse_russia_regions', 
     soil_table='egrpr_esoil_ru.soil_map_m2_5_v',
     region_buf_size=0,
 ):
     try:
-        with open('.secret/.gdcdb', encoding='utf-8') as f:
+        with open(postgres_info, encoding='utf-8') as f:
             pg = json.load(f)
     except:
         raise
@@ -556,12 +662,16 @@ def prepare_soil_limitations(
         region_shortname = get_region_shortname(region)
         soil_gdf = soil_gdf.clip(region_gdf)
         soil_gdf.to_file(
-            'result/soil_limitations.gpkg', 
+            # 'result/soil_limitations.gpkg', 
+            f"result/{region_shortname}_limitations.gpkg", 
             layer=f"{region_shortname}_soil"
         )
+        return soil_gdf
+    return None
 
 
 def prepare_settlements_limitations(
+    postgres_info='.secret/.gdcdb',
     region='', 
     regions_table='admin.hse_russia_regions',
     nspd_table='nspd.nspd_settlements_pol',
@@ -569,7 +679,7 @@ def prepare_settlements_limitations(
     region_buf_size=0,
 ):
     try:
-        with open('.secret/.gdcdb', encoding='utf-8') as f:
+        with open(postgres_info, encoding='utf-8') as f:
             pg = json.load(f)
     except:
         raise
@@ -634,19 +744,23 @@ def prepare_settlements_limitations(
         region_shortname = get_region_shortname(region)
         settlements_gdf = settlements_gdf.clip(region_gdf)
         settlements_gdf.to_file(
-            'result/poppol_limitations.gpkg', 
+            # 'result/poppol_limitations.gpkg', 
+            f"result/{region_shortname}_limitations.gpkg", 
             layer=f"poppol_merge_{region_shortname}"
         )
+        return settlements_gdf
+    return None
 
 
 def prepare_oopt_limitations(
+    postgres_info='.secret/.gdcdb',
     region='', 
     regions_table='admin.hse_russia_regions', 
     oopt_table='ecology.pkp_oopt_russia_2024',
     region_buf_size=0,
 ):
     try:
-        with open('.secret/.gdcdb', encoding='utf-8') as f:
+        with open(postgres_info, encoding='utf-8') as f:
             pg = json.load(f)
     except:
         raise
@@ -681,13 +795,251 @@ def prepare_oopt_limitations(
         region_shortname = get_region_shortname(region)
         oopt_gdf = oopt_gdf.clip(region_gdf)
         oopt_gdf.to_file(
-            'result/oopt_limitations.gpkg', 
+            # 'result/oopt_limitations.gpkg', 
+            f"result/{region_shortname}_limitations.gpkg", 
             layer=f"{region_shortname}_oopt"
         )
+        return oopt_gdf
+    return None
+
+
+def prepare_forest_limitations(
+    postgres_info='.secret/.gdcdb',
+    region='', 
+    regions_table='admin.hse_russia_regions', 
+    forest_table='forest.pkp_forest_glf',
+    region_buf_size=0,
+):
+    try:
+        with open(postgres_info, encoding='utf-8') as f:
+            pg = json.load(f)
+    except:
+        raise
+    try:
+        engine = sqlalchemy.create_engine(
+            f"postgresql+psycopg2://{pg['user']}:{pg['password']}@{pg['host']}:{pg['port']}/{pg['database']}",
+            connect_args={
+                "sslmode": "verify-full",
+                "target_session_attrs": "read-write"
+            },
+        )
+    except:
+        raise
+    try:
+        sql = f"select * from {regions_table} where lower(region) = '{region.lower()}';"
+        region_gdf = gpd.read_postgis(sql, engine)
+        if region_buf_size > 0:
+            region_buffer = calculate_geod_buffers(region_gdf, 'laea', 'value', region_buf_size, geom_field='geom')
+            region_gdf = region_gdf.set_geometry(region_buffer)
+        sql = f"select gid, COALESCE(ST_MakeValid(geom), geom) as geom, vmr from {forest_table} forest " \
+            f"where ST_Intersects(" \
+            f"(select ST_Buffer(geom::geography, {region_buf_size})::geometry from {regions_table} where lower(region) = '{region.lower()}' limit 1), " \
+            f"forest.geom" \
+            f");"
+        forest_gdf = gpd.read_postgis(sql, engine)
+        pass
+    except:
+        raise
+    if not forest_gdf.empty:
+        region_shortname = get_region_shortname(region)
+        forest_gdf = forest_gdf.set_geometry(forest_gdf.geometry.make_valid())
+        forest_gdf = forest_gdf.clip(region_gdf)
+        # forest_gdf = forest_gdf.dissolve(by=['vmr'], dropna=False)
+        forest_gdf = forest_gdf.dissolve(dropna=False)
+        forest_gdf = forest_gdf.explode()
+        forest_gdf.to_file(
+            # 'result/forest_limitations.gpkg', 
+            f"result/{region_shortname}_limitations.gpkg", 
+            layer=f"forest_{region_shortname}"
+        )
+        return forest_gdf
+    return None
+
+
+def prepare_limitations(
+    postgres_info='.secret/.gdcdb',
+    region='Липецкая область', 
+    regions_table='admin.hse_russia_regions',
+    region_buf_size=5000,
+    water_line_table='osm.gis_osm_waterways_free',
+    water_pol_table='osm.gis_osm_water_a_free',
+    hydro_buffer_distance_m = 5,
+    hydro_buffer_crs='utm',
+    wetlands_table='osm.osm_wetlands_russia_final',
+    soil_table='egrpr_esoil_ru.soil_map_m2_5_v',
+    fabdem_tiles_table='elevation.fabdem_v1_2_tiles',
+    slope_threshold=12,
+    fabdem_zip_path=r"\\172.21.204.20\geodata\_PROJECTS\pkp\vm0047_prod\dem_fabdem",
+    rescale_slope_raster=True,
+    slope_raster_rescale_size_m=10,
+    nspd_settlements_table='nspd.nspd_settlements_pol',
+    osm_settlements_table='osm.gis_osm_places_a_free',
+    oopt_table='ecology.pkp_oopt_russia_2024',
+    forest_table='forest.pkp_forest_glf'
+):
+    
+    water_poly, water_lines_buf, water_prot_zone = prepare_water_limitations(
+        postgres_info=postgres_info,
+        region=region,
+        water_line_table=water_line_table,
+        water_pol_table=water_pol_table,
+        regions_table=regions_table,
+        region_buf_size=region_buf_size,
+        buffer_distance = hydro_buffer_distance_m,
+        buffer_crs = hydro_buffer_crs
+        )
+
+    wetland = prepare_wetlands_limitations(
+        postgres_info=postgres_info,
+        region=region,
+        regions_table=regions_table,
+        wetlands_table=wetlands_table,
+        region_buf_size=region_buf_size,
+    )
+
+    soil = prepare_soil_limitations(
+        postgres_info=postgres_info,
+        region=region,
+        regions_table=regions_table,
+        soil_table=soil_table,
+        region_buf_size=region_buf_size,
+    )
+
+    slope_more_12 = prepare_slope_limitations(
+        postgres_info=postgres_info,
+        region=region,
+        slope_threshold=slope_threshold,
+        regions_table=regions_table,
+        region_buf_size=region_buf_size,
+        fabdem_tiles_table=fabdem_tiles_table,
+        fabdem_zip_path=fabdem_zip_path,
+        rescale=rescale_slope_raster,
+        rescale_size=slope_raster_rescale_size_m
+    )
+
+    poppol_merge = prepare_settlements_limitations(
+        postgres_info=postgres_info,
+        region=region,
+        regions_table=regions_table,
+        nspd_table=nspd_settlements_table,
+        osm_table=osm_settlements_table,
+        region_buf_size=region_buf_size
+    )
+
+    oopt = prepare_oopt_limitations(
+        postgres_info=postgres_info,
+        region=region,
+        regions_table=regions_table,
+        oopt_table=oopt_table,
+        region_buf_size=region_buf_size
+    )
+
+    forest = prepare_forest_limitations(
+        postgres_info=postgres_info,
+        region=region,
+        regions_table=regions_table,
+        forest_table=forest_table,
+        region_buf_size=region_buf_size
+    )
+    
+    # Merge all limitations into a single GeoDataFrame
+    src_gdfs = [
+        ("water_poly", water_poly),
+        ("water_lines_buf", water_lines_buf),
+        ("water_prot_zone", water_prot_zone),
+        ("wetland", wetland),
+        ("soil", soil),
+        ("slope_more_12", slope_more_12),
+        ("poppol_merge", poppol_merge),
+        ("oopt", oopt),
+        ("forest", forest),
+    ]
+    parts = []
+    for name, gdf in src_gdfs:
+        if gdf is None or gdf.empty:
+            continue
+        # Ensure CRS is EPSG:4326
+        try:
+            if gdf.crs is None or str(gdf.crs).lower() not in ("epsg:4326", "epsg:4326"):
+                gdf = gdf.to_crs("EPSG:4326")
+        except Exception:
+            # If CRS conversion fails, keep as is
+            pass
+        # Add source column to keep provenance
+        gdf = gdf.copy()
+        gdf["src"] = name
+        parts.append(gdf)
+    if parts:
+        # Unify columns
+        all_cols = set()
+        for g in parts:
+            all_cols |= set(g.columns)
+        for g in parts:
+            for c in all_cols:
+                if c not in g.columns:
+                    g[c] = pd.NA
+        # Concatenate
+        merged_gdf = gpd.GeoDataFrame(
+            pd.concat([g[list(all_cols)] for g in parts], ignore_index=True),
+            geometry='geom',
+            crs='EPSG:4326'
+        )
+        # Explode geometries so each part is a separate feature
+        try:
+            merged_gdf = merged_gdf.explode(index_parts=False)
+        except TypeError:
+            # Fallback for older GeoPandas versions without index_parts
+            merged_gdf = merged_gdf.explode().reset_index(drop=True)
+        # Reset index and regenerate sequential gid
+        merged_gdf = merged_gdf.reset_index(drop=True)
+        merged_gdf['gid'] = range(1, len(merged_gdf) + 1)
+        # Keep only gid and geom
+        merged_gdf = merged_gdf[['gid', 'geom']]
+        merged_gdf = merged_gdf.dissolve(dropna=False)
+        merged_gdf = merged_gdf.explode()
+        
+        # Split by 6' grid (0.1 degree) to further subdivide geometries
+        step_deg = 0.1  # 6 arc-minutes
+        minx, miny, maxx, maxy = merged_gdf.total_bounds
+        # Snap bounds to grid
+        start_x = math.floor(minx / step_deg) * step_deg
+        end_x = math.ceil(maxx / step_deg) * step_deg
+        start_y = math.floor(miny / step_deg) * step_deg
+        end_y = math.ceil(maxy / step_deg) * step_deg
+        xs = np.arange(start_x, end_x, step_deg)
+        ys = np.arange(start_y, end_y, step_deg)
+        cells = []
+        cell_ids = []
+        for i, x in enumerate(xs):
+            for j, y in enumerate(ys):
+                cells.append(shapely.geometry.box(x, y, x + step_deg, y + step_deg))
+                cell_ids.append(f"c_{i}_{j}")
+        grid_gdf = gpd.GeoDataFrame({'cell_id': cell_ids, 'geom': cells}, geometry='geom', crs='EPSG:4326')
+        # Intersect merged limitations with grid to split them
+        split_gdf = gpd.overlay(merged_gdf, grid_gdf, how='intersection')
+        try:
+            split_gdf = split_gdf.explode(index_parts=False)
+        except TypeError:
+            split_gdf = split_gdf.explode().reset_index(drop=True)
+        # Keep consistent columns and continue downstream with split geometries
+        # split_gdf = split_gdf[['gid', 'geom', 'cell_id']]
+        merged_gdf = split_gdf
+        
+        # Save merged limitations
+        region_shortname = get_region_shortname(region)
+        if region_shortname is None:
+            region_shortname = "region"
+        merged_gdf.to_file(
+            f"result/{region_shortname}_limitations.gpkg",
+            layer=f"{region_shortname}_all_limitations"
+        )
+        return merged_gdf
+    return None
 
 
 if __name__ == '__main__':
     # prepare_water_limitations(
+    #     region='Липецкая область',
     #     source_water_line='data/Lipetsk_water_lines_3857/Lipetsk_water_lines_3857.shp',
     #     source_water_pol='data/Lipetsk_water_poly_3857/Lipetsk_water_poly_3857.shp',
     #     result_gpkg='result/water_limitations.gpkg',
@@ -717,7 +1069,32 @@ if __name__ == '__main__':
     #     region='Калужская область'
     # )
 
-    prepare_oopt_limitations(
-        region='Липецкая область'
-    )
+    # prepare_oopt_limitations(
+    #     region='Липецкая область'
+    # )
+
+    # prepare_forest_limitations(
+    #     region='Липецкая область'
+    # )
         
+    prepare_limitations(
+        region='Липецкая область',
+        postgres_info='.secret/.gdcdb',
+        regions_table='admin.hse_russia_regions',
+        region_buf_size=5000,
+        water_line_table='osm.gis_osm_waterways_free',
+        water_pol_table='osm.gis_osm_water_a_free',
+        hydro_buffer_distance_m=5,
+        hydro_buffer_crs='utm',
+        wetlands_table='osm.osm_wetlands_russia_final',
+        soil_table='egrpr_esoil_ru.soil_map_m2_5_v',
+        fabdem_tiles_table='elevation.fabdem_v1_2_tiles',
+        slope_threshold=12,
+        fabdem_zip_path=r"\\172.21.204.20\geodata\_PROJECTS\pkp\vm0047_prod\dem_fabdem",
+        rescale_slope_raster=True,
+        slope_raster_rescale_size_m=10,
+        nspd_settlements_table='nspd.nspd_settlements_pol',
+        osm_settlements_table='osm.gis_osm_places_a_free',
+        oopt_table='ecology.pkp_oopt_russia_2024',
+        forest_table='forest.pkp_forest_glf'
+    )
