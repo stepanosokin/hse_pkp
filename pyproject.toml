@@ -5,18 +5,25 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "brotli>=1.1.0",
+    "cryptography>=46.0.1",
     "gdal==3.10",
     "geopandas>=1.1.1",
     "psycopg2-binary>=2.9.10",
+    "pyjwt>=2.10.1",
     "pyproj>=3.7.1",
     "rasterio>=1.4.3",
     "sqlalchemy>=2.0.43",
     "tqdm>=4.67.1",
+    "vgdb-general",
+    "yadisk>=3.4.0",
+    "yandexcloud>=0.361.0",
 ]
 [tool.uv.sources]
 gdal = [
   { index = "gdal-wheels" }
 ]
+vgdb-general = { git = "https://github.com/stepanosokin/vgdb_general.git" }
 
 [[tool.uv.index]]
 name = "gdal-wheels"

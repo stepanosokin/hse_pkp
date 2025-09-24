@@ -20,6 +20,103 @@ import math
 from osgeo import gdal
 from osgeo import gdal_array
 from osgeo_utils import gdal_calc
+from vgdb_general import smart_http_request
+import requests
+import yadisk
+
+
+def get_y_token(yinfo='.secret/.yinfo'):
+    """Получение токена доступа к Яндекс.Диску.
+
+    Аргументы:
+    - yinfo (str): путь к JSON-файлу с параметрами/учётными данными для доступа
+      к Яндекс.Диску (например, '.secret/.yinfo').
+
+    Структура файла .yinfo (JSON):
+    - app_name (str): название приложения в Яндекс.OAuth. Используется для
+      идентификации приложения, не участвует напрямую в аутентификации.
+    - account_name (str): имя аккаунта Яндекса (например, e-mail), от имени
+      которого зарегистрирован OAuth‑клиент и выдавались права.
+    - client_id (str): идентификатор OAuth‑клиента, выданный при регистрации
+      приложения в Яндекс.OAuth. Публичная часть пары для запроса токена.
+    - client_secret (str): секрет OAuth‑клиента (приватная часть), используется
+      совместно с client_id для получения/обновления токена. Должен храниться в
+      секрете и не коммититься в репозиторий.
+    """
+    try:
+        with open(yinfo, encoding='utf-8') as f:
+            yi = json.load(f)
+    except:
+        raise
+    if yi['client_id'] is None or yi['client_secret'] is None or yi['redirect_uri'] is None:
+        raise ValueError("client_id or client_secret or redirect_uri is None")
+    
+    # https://yandex.ru/dev/id/doc/ru/codes/code-and-token
+    # https://yadisk.readthedocs.io/ru/latest/intro.html
+    with yadisk.Client(yi['client_id'], yi['client_secret']) as client:
+        url = client.get_code_url()
+        pass
+    
+    #####################################################
+    # url = "https://oauth.yandex.ru/authorize"
+    # headers = {
+    #     "accept": "application/json",
+    #     "accept-encoding": "gzip, deflate, br, zstd",
+    # }
+    # params = {
+    #     "response_type": "code",
+    #     "client_id": yi['client_id']
+    # }
+    # with requests.Session() as s:
+    #     status, auth_code_response = smart_http_request(s, url=url, params=params, headers=headers)
+    #     if status != 200:
+    #         raise ValueError("auth_code_response is not 200")
+    #     # auth_code_json = json.loads(auth_code_response.text)
+    #     # auth_code_response_txt = auth_code_response.text
+    #     # auth_code = auth_code_response.text.split('code=')[1].split('&')[0]
+    #     # auth_code = auth_code_response.text.split('code=')[1].split('&')[0]
+    #     response = requests.get(yi['redirect_uri'])
+    #     pass
+
+def get_lulc_from_y(link='', token=''):
+    """Для создания токена доступа к Яндекс.Диску, надо зарегистрировать приложение в Яндексе и создать для него токен:
+        перейти по адресу https://oauth.yandex.ru/client/new/api
+        Создайте новое приложение:
+        Заполните поля "Название" и "Иконка" для вашего приложения.
+        Выберите тип платформы "Веб-сервисы".
+        В поле Redirect URI укажите https://oauth.yandex.ru/verification_code.
+        Добавьте необходимые права доступа:
+        Нажмите "Добавить" в разделе "Название доступа" и выберите разрешение, например, "Запись в любом месте на Диске".
+        Получите токен:
+            Нажмите "Добавить приложение".
+            Скопируйте сформированную ссылку из раздела "Для веб-сервисов", вставьте её в адресную строку браузера.
+        На странице авторизации выберите нужные права для приложения и нажмите "Разрешить".
+        Ваш токен будет указан на открывшейся странице, скопируйте его и используйте для доступа к Яндекс Диску. 
+    Для данного проекта сгенерировано приложение pkp_bot и указана привилегия cloud_api:disk.read.    
+    Использован Яндекс-профиль s.osokin@hse.ru с привязкой к аккаунту Госуслуг "Осокин Степан Артемович".
+    """
+    pass
+
+
+def download_from_y_obj_storage():
+    pass
+    # https://yandex.cloud/ru/docs/storage/s3/  
+    # https://yandex.cloud/ru/docs/iam/operations/iam-token/create-for-sa#via-jwt
+    # https://yandex.cloud/ru/docs/storage/operations/objects/download
+    # https://yandex.cloud/ru/docs/storage/s3/
+    # https://yandex.cloud/ru/docs/storage/s3/api-ref/object/get
+    # https://yandex.cloud/en/docs/datasphere/operations/data/connect-to-s3
+
+def calculate_forest_belt(
+    region='Липецкая область',
+    lulc_link=''
+):
+    pass
+    # https://yandex.cloud/ru/docs/storage/s3/  
+    # https://yandex.cloud/ru/docs/iam/operations/iam-token/create-for-sa#via-jwt
+    # https://yandex.cloud/ru/docs/storage/operations/objects/download
+    
+    
 
 
 def get_region_shortname(region):
@@ -1077,24 +1174,26 @@ if __name__ == '__main__':
     #     region='Липецкая область'
     # )
         
-    prepare_limitations(
-        region='Липецкая область',
-        postgres_info='.secret/.gdcdb',
-        regions_table='admin.hse_russia_regions',
-        region_buf_size=5000,
-        water_line_table='osm.gis_osm_waterways_free',
-        water_pol_table='osm.gis_osm_water_a_free',
-        hydro_buffer_distance_m=5,
-        hydro_buffer_crs='utm',
-        wetlands_table='osm.osm_wetlands_russia_final',
-        soil_table='egrpr_esoil_ru.soil_map_m2_5_v',
-        fabdem_tiles_table='elevation.fabdem_v1_2_tiles',
-        slope_threshold=12,
-        fabdem_zip_path=r"\\172.21.204.20\geodata\_PROJECTS\pkp\vm0047_prod\dem_fabdem",
-        rescale_slope_raster=True,
-        slope_raster_rescale_size_m=10,
-        nspd_settlements_table='nspd.nspd_settlements_pol',
-        osm_settlements_table='osm.gis_osm_places_a_free',
-        oopt_table='ecology.pkp_oopt_russia_2024',
-        forest_table='forest.pkp_forest_glf'
-    )
+    # prepare_limitations(
+    #     region='Липецкая область',
+    #     postgres_info='.secret/.gdcdb',
+    #     regions_table='admin.hse_russia_regions',
+    #     region_buf_size=5000,
+    #     water_line_table='osm.gis_osm_waterways_free',
+    #     water_pol_table='osm.gis_osm_water_a_free',
+    #     hydro_buffer_distance_m=5,
+    #     hydro_buffer_crs='utm',
+    #     wetlands_table='osm.osm_wetlands_russia_final',
+    #     soil_table='egrpr_esoil_ru.soil_map_m2_5_v',
+    #     fabdem_tiles_table='elevation.fabdem_v1_2_tiles',
+    #     slope_threshold=12,
+    #     fabdem_zip_path=r"\\172.21.204.20\geodata\_PROJECTS\pkp\vm0047_prod\dem_fabdem",
+    #     rescale_slope_raster=True,
+    #     slope_raster_rescale_size_m=10,
+    #     nspd_settlements_table='nspd.nspd_settlements_pol',
+    #     osm_settlements_table='osm.gis_osm_places_a_free',
+    #     oopt_table='ecology.pkp_oopt_russia_2024',
+    #     forest_table='forest.pkp_forest_glf'
+    # )
+
+    get_y_token()

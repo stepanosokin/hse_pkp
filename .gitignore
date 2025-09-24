@@ -13,3 +13,8 @@ data/
 result/
 .secret/.gdcdb
 fabdem/
+.secret/.iamtoken
+.secret/.jwt
+.secret/.yinfo
+.secret/.yinfo copy
+.secret/pkp-bot-service-account-auth-key.json
