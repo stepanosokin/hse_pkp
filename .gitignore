@@ -11,8 +11,9 @@ wheels/
 
 data/
 result/
-.secret/.gdcdb
+.secret/
 fabdem/
+lulc/
 .secret/.iamtoken
 .secret/.jwt
 .secret/.yinfo
