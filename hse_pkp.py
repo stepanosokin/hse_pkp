@@ -20,9 +20,10 @@ import math
 from osgeo import gdal
 from osgeo import gdal_array
 from osgeo_utils import gdal_calc
-from vgdb_general import smart_http_request
-import requests
-import yadisk
+# from vgdb_general import smart_http_request
+# import requests
+# import yadisk
+import boto3
 
 
 def get_y_token(yinfo='.secret/.yinfo'):
@@ -98,25 +99,47 @@ def get_lulc_from_y(link='', token=''):
     pass
 
 
-def download_from_y_obj_storage():
+def download_from_y_obj_storage(
+    bucket='pkp-lulc-bucket',
+    key='S2LULC_10m_LAEA_48_202507081046.tif',
+    dest_file='lulc/S2LULC_10m_LAEA_48_202507081046.tif',
+    y_static_key_file='.secret/pkp-bot-static-key.json'
+    ):
     pass
+    # https://yandex.cloud/ru/docs/iam/concepts/authorization/access-key
     # https://yandex.cloud/ru/docs/storage/s3/  
-    # https://yandex.cloud/ru/docs/iam/operations/iam-token/create-for-sa#via-jwt
+    # # это вроде не подходит для Object Storage https://yandex.cloud/ru/docs/iam/operations/iam-token/create-for-sa#via-jwt
     # https://yandex.cloud/ru/docs/storage/operations/objects/download
-    # https://yandex.cloud/ru/docs/storage/s3/
     # https://yandex.cloud/ru/docs/storage/s3/api-ref/object/get
     # https://yandex.cloud/en/docs/datasphere/operations/data/connect-to-s3
 
-def calculate_forest_belt(
-    region='Липецкая область',
-    lulc_link=''
-):
-    pass
-    # https://yandex.cloud/ru/docs/storage/s3/  
-    # https://yandex.cloud/ru/docs/iam/operations/iam-token/create-for-sa#via-jwt
-    # https://yandex.cloud/ru/docs/storage/operations/objects/download
-    
-    
+    try:
+        with open(y_static_key_file, encoding='utf-8') as f:
+            creds = json.load(f)
+    except:
+        raise
+    if creds['key_id'] is None or creds['secret'] is None:
+        raise ValueError("key_id or secret is None")
+    session = boto3.session.Session()
+    s3 = session.client(
+        service_name='s3',
+        endpoint_url='https://storage.yandexcloud.net',
+        aws_access_key_id=creds['key_id'],
+        aws_secret_access_key=creds['secret']
+    )
+    # Получить список объектов в бакете
+    for k in s3.list_objects(Bucket=bucket)['Contents']:
+        print(k['Key'])
+        pass
+    try:
+        # s3.download_file(Bucket=bucket, Key=key, Filename=dest_file)
+        s3.download_file(bucket, key, dest_file)
+    except Exception as e:
+        raise RuntimeError(f"Failed to download {key} from {bucket}: {e}")
+        pass
+
+
+
 
 
 def get_region_shortname(region):
@@ -953,6 +976,165 @@ def prepare_forest_limitations(
     return None
 
 
+def calculate_forest_belt(
+    region='Липецкая область',
+    lulc_link='lulc/S2LULC_10m_LAEA_48_202507081046.tif'
+):
+    current_dir = os.getcwd()
+    os.environ["PROJ_LIB"] = os.path.join(current_dir, '.venv', 'Lib', 'site-packages', 'osgeo', 'data', 'proj')
+    lulcdir = os.path.join(current_dir, 'lulc')
+    if not os.path.isdir(lulcdir):
+        os.mkdir(lulcdir)
+    
+    # Открыть растр LULC и векторизовать его в GeoDataFrame
+    try:
+        with rasterio.open(lulc_link) as src:
+            band = src.read(1)
+            # Маска валидных пикселей (исключаем NoData, если задано)
+            if src.nodata is not None:
+                mask = band != src.nodata
+            else:
+                mask = np.ones(band.shape, dtype=bool)
+
+            shapes_iter = rasterio.features.shapes(band, mask=mask, transform=src.transform)
+            records = []
+            for geom, value in shapes_iter:
+                if geom is None:
+                    continue
+                try:
+                    shp = shapely.geometry.shape(geom)
+                    if shp.is_empty:
+                        continue
+                    records.append({
+                        'value': int(value) if value is not None else None,
+                        'geometry': shp
+                    })
+                except Exception:
+                    # Пропускать проблемные примитивы
+                    continue
+
+            lulc_gdc = gpd.GeoDataFrame(records, geometry='geometry', crs=src.crs)
+
+            
+    except Exception as e:
+        raise RuntimeError(f"Failed to open or vectorize raster '{lulc_link}': {e}")
+    
+    # Сохранить в GeoPackage result/lulc.gpkg, слой называется как имя tif файла
+    result_dir = os.path.join(current_dir, 'result')
+    if not os.path.isdir(result_dir):
+        os.mkdir(result_dir)
+    layer_name = os.path.splitext(os.path.basename(lulc_link))[0]
+    output_gpkg = os.path.join(result_dir, 'lulc.gpkg')
+    try:
+        lulc_gdc.to_file(output_gpkg, layer=layer_name, driver='GPKG')
+    except Exception as e:
+        raise RuntimeError(f"Failed to save vectorized LULC to '{output_gpkg}' layer '{layer_name}': {e}")
+    
+    # Дополнительно: создать новый растр lulc_meadows.tif, где пиксели со значением 3 -> 1, остальные -> NoData
+    try:
+        with rasterio.open(lulc_link) as src_re:
+            band = src_re.read(1)
+            out_arr = np.where(band == 3, 1, 0).astype(np.uint8)
+            out_mask = (out_arr == 0)
+            out_ma = np.ma.array(out_arr, mask=out_mask)
+
+            profile = src_re.profile.copy()
+            profile.update({
+                'dtype': rasterio.uint8,
+                'count': 1,
+                'nodata': 0,
+                'compress': 'LZW'
+            })
+
+            out_raster_path = os.path.join(current_dir, 'lulc', 'lulc_meadows.tif')
+            out_dir = os.path.dirname(out_raster_path)
+            if out_dir and not os.path.isdir(out_dir):
+                os.makedirs(out_dir, exist_ok=True)
+
+            with rasterio.open(out_raster_path, 'w', **profile) as dst:
+                dst.write(out_ma, 1)
+    except Exception as e:
+        raise RuntimeError(f"Failed to create 'lulc_meadows.tif' from '{lulc_link}': {e}")
+
+    # Добавить в lulc_gdc поля area_ha (float, геодезическая площадь) и name (text 50),
+    # заполнить name по value и сохранить в luls.gpkg
+    try:
+        # Геодезическая площадь в гектарах с использованием эллипсоида WGS84
+        try:
+            gdf_wgs = lulc_gdc.to_crs(4326)
+        except Exception:
+            gdf_wgs = lulc_gdc
+        geod = Geod(ellps='WGS84')
+        areas_ha = []
+        for geom in gdf_wgs.geometry:
+            if geom is None or geom.is_empty:
+                areas_ha.append(0.0)
+                continue
+            try:
+                area_m2, _ = geod.geometry_area_perimeter(geom)
+                areas_ha.append(abs(area_m2) / 10000.0)
+            except Exception:
+                areas_ha.append(0.0)
+        lulc_gdc['area_ha'] = pd.to_numeric(areas_ha, errors='coerce')
+
+        # Классифицированное имя по значению
+        value_to_name = {
+            1: 'water',
+            2: 'forest',
+            3: 'meadow',
+            4: 'arable',
+            5: 'build',
+        }
+        lulc_gdc['name'] = lulc_gdc['value'].map(value_to_name)
+        # Ограничить длину до 50 символов на всякий случай
+        lulc_gdc['name'] = lulc_gdc['name'].astype('string').str.slice(0, 50)
+
+        # Разбить на 5 GeoDataFrame по значению поля 'name'
+        water_gdc = lulc_gdc[lulc_gdc['name'] == 'water'].copy()
+        forest_gdc = lulc_gdc[lulc_gdc['name'] == 'forest'].copy()
+        meadow_gdc = lulc_gdc[lulc_gdc['name'] == 'meadow'].copy()
+        arable_gdc = lulc_gdc[lulc_gdc['name'] == 'arable'].copy()
+        build_gdc = lulc_gdc[lulc_gdc['name'] == 'build'].copy()
+
+        # Удалить из лесов объекты площадью <= 0.1 га
+        forest_gdc = forest_gdc[forest_gdc['area_ha'] > 0.1].copy()
+
+        # Построить геодезические буферы 50 м вокруг forest_gdc, объединить, взорвать и сохранить как forest_50m
+        if not forest_gdc.empty:
+            try:
+                # Буферы считаем в геодезическом режиме: сначала в WGS84, затем используем calculate_geod_buffers
+                forest_wgs = forest_gdc.to_crs(4326)
+                buffer_geom = calculate_geod_buffers(
+                    forest_wgs, buffer_crs='laea', buffer_dist_source='value', buffer_distance=50, geom_field='geometry'
+                )
+                forest_buf = forest_wgs.set_geometry(buffer_geom)
+                # Union all buffered parts
+                unioned = forest_buf.union_all()
+                forest_50m = gpd.GeoDataFrame(gpd.GeoSeries(unioned))
+                forest_50m = forest_50m.rename(columns={0: 'geometry'}).set_geometry('geometry')
+                forest_50m = forest_50m.set_crs('EPSG:4326')
+                # Explode to individual polygons
+                try:
+                    forest_50m = forest_50m.explode(index_parts=False)
+                except TypeError:
+                    forest_50m = forest_50m.explode().reset_index(drop=True)
+                # Save to GPKG as 'forest_50m'
+                forest_50m.to_file(output_gpkg, layer='forest_50m', driver='GPKG')
+            except Exception as e:
+                raise RuntimeError(f"Failed to build/save forest_50m buffers: {e}")
+
+        # # Сохранение в lulc.gpkg с именем слоя <raster_name>_classified
+        # classified_layer = f"{layer_name}_classified"
+        # out_gpkg = os.path.join(result_dir, 'lulc.gpkg')
+        # lulc_gdc.to_file(out_gpkg, layer=classified_layer, driver='GPKG')
+    except Exception as e:
+        raise RuntimeError(f"Failed to build/save classified LULC GeoDataFrame: {e}")
+
+    # Ничего не возвращаем: результаты сохранены на диск
+    return None
+    
+
+
 def prepare_limitations(
     postgres_info='.secret/.gdcdb',
     region='Липецкая область', 
@@ -1134,6 +1316,9 @@ def prepare_limitations(
     return None
 
 
+
+
+
 if __name__ == '__main__':
     # prepare_water_limitations(
     #     region='Липецкая область',
@@ -1196,4 +1381,9 @@ if __name__ == '__main__':
     #     forest_table='forest.pkp_forest_glf'
     # )
 
-    get_y_token()
+    # download_from_y_obj_storage()
+
+    calculate_forest_belt(
+        region='Липецкая область',
+        lulc_link='lulc/S2LULC_10m_LAEA_48_202507081046_sample.tif'
+    )
