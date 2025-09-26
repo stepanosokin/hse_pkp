@@ -978,7 +978,20 @@ def prepare_forest_limitations(
 
 def calculate_forest_belt(
     region='Липецкая область',
-    lulc_link='lulc/S2LULC_10m_LAEA_48_202507081046.tif'
+    limitations_all=None,   # geodataframe derived from prepare_limitations
+    lulc_link='lulc/S2LULC_10m_LAEA_48_202507081046.tif',
+    postgres_info='.secret/.gdcdb',
+    regions_table='admin.hse_russia_regions',
+    region_buf_size=5000,
+    road_table='osm.gis_osm_roads_free',
+    road_buf_size_rule={
+        "fclass  in  ('primary', 'primary_link')": 80,
+        "fclass in ('motorway' , 'motorway_link')": 80,
+        "fclass in ('secondary', 'secondary_link')": 70,
+        "fclass in ('tertiary', 'tertiary_link')": 70,
+        "fclass in ('trunk', 'trunk_link')": 70,
+        "fclass in ('unclassified')": 70,
+    },
 ):
     current_dir = os.getcwd()
     os.environ["PROJ_LIB"] = os.path.join(current_dir, '.venv', 'Lib', 'site-packages', 'osgeo', 'data', 'proj')
@@ -986,6 +999,7 @@ def calculate_forest_belt(
     if not os.path.isdir(lulcdir):
         os.mkdir(lulcdir)
     
+    ######################LULC######################
     # Открыть растр LULC и векторизовать его в GeoDataFrame
     try:
         with rasterio.open(lulc_link) as src:
@@ -1098,7 +1112,9 @@ def calculate_forest_belt(
 
         # Удалить из лесов объекты площадью <= 0.1 га
         forest_gdc = forest_gdc[forest_gdc['area_ha'] > 0.1].copy()
+        
 
+        ######################forest######################
         # Построить геодезические буферы 50 м вокруг forest_gdc, объединить, взорвать и сохранить как forest_50m
         if not forest_gdc.empty:
             try:
@@ -1119,7 +1135,10 @@ def calculate_forest_belt(
                 except TypeError:
                     forest_50m = forest_50m.explode().reset_index(drop=True)
                 # Save to GPKG as 'forest_50m'
-                forest_50m.to_file(output_gpkg, layer='forest_50m', driver='GPKG')
+                region_shortname = get_region_shortname(region)
+
+                forest_50m.to_file(f"result/{region_shortname}_limitations.gpkg", layer=f'{region_shortname}_forest_50m', driver='GPKG')
+            
             except Exception as e:
                 raise RuntimeError(f"Failed to build/save forest_50m buffers: {e}")
 
@@ -1130,9 +1149,251 @@ def calculate_forest_belt(
     except Exception as e:
         raise RuntimeError(f"Failed to build/save classified LULC GeoDataFrame: {e}")
 
+    ######################road_OSM_cover_buf######################
+    road_OSM_cover_buf = prepare_road_limitations(
+        postgres_info=postgres_info,
+        region=region, 
+        regions_table=regions_table,
+        region_buf_size=region_buf_size,
+        road_table=road_table,
+        road_buf_size_rule=road_buf_size_rule,
+        road_buffer_crs='utm',
+    )
+
+    ###################объединение ограничений########################
+    if limitations_all is not None and road_OSM_cover_buf is not None and forest_50m is not None:
+        ############################################
+        # Объединяем ограничения
+        # Merge all limitations into a single GeoDataFrame
+        src_gdfs = [
+            ("limitations_all", limitations_all),
+            ("road_OSM_cover_buf", road_OSM_cover_buf),
+            ("forest_50m", forest_50m)
+        ]
+        parts = []
+        for name, gdf in src_gdfs:
+            if gdf is None or gdf.empty:
+                continue
+            # Ensure CRS is EPSG:4326
+            try:
+                if gdf.crs is None or str(gdf.crs).lower() not in ("epsg:4326", "epsg:4326"):
+                    gdf = gdf.to_crs("EPSG:4326")
+            except Exception:
+                # If CRS conversion fails, keep as is
+                pass
+            # Add source column to keep provenance
+            gdf = gdf.copy()
+            gdf["src"] = name
+            parts.append(gdf)
+        if parts:
+            # Unify columns
+            all_cols = set()
+            for g in parts:
+                all_cols |= set(g.columns)
+            for g in parts:
+                for c in all_cols:
+                    if c not in g.columns:
+                        g[c] = pd.NA
+            # Concatenate
+            limitation_full = gpd.GeoDataFrame(
+                pd.concat([g[list(all_cols)] for g in parts], ignore_index=True),
+                geometry='geometry',
+                crs='EPSG:4326'
+            )
+            # Explode geometries so each part is a separate feature
+            try:
+                limitation_full = limitation_full.explode(index_parts=False)
+            except TypeError:
+                # Fallback for older GeoPandas versions without index_parts
+                limitation_full = limitation_full.explode().reset_index(drop=True)
+            # Reset index and regenerate sequential gid
+            limitation_full = limitation_full.reset_index(drop=True)
+            limitation_full['gid'] = range(1, len(limitation_full) + 1)
+            # Keep only gid and geom
+            limitation_full = limitation_full[['gid', 'geometry']]
+            limitation_full = limitation_full.dissolve(dropna=False)
+            limitation_full = limitation_full.explode()
+            
+            # Split by 6' grid (0.1 degree) to further subdivide geometries
+            step_deg = 0.1  # 6 arc-minutes
+            minx, miny, maxx, maxy = limitation_full.total_bounds
+            # Snap bounds to grid
+            start_x = math.floor(minx / step_deg) * step_deg
+            end_x = math.ceil(maxx / step_deg) * step_deg
+            start_y = math.floor(miny / step_deg) * step_deg
+            end_y = math.ceil(maxy / step_deg) * step_deg
+            xs = np.arange(start_x, end_x, step_deg)
+            ys = np.arange(start_y, end_y, step_deg)
+            cells = []
+            cell_ids = []
+            for i, x in enumerate(xs):
+                for j, y in enumerate(ys):
+                    cells.append(shapely.geometry.box(x, y, x + step_deg, y + step_deg))
+                    cell_ids.append(f"c_{i}_{j}")
+            grid_gdf = gpd.GeoDataFrame({'cell_id': cell_ids, 'geometry': cells}, geometry='geometry', crs='EPSG:4326')
+            # Intersect merged limitations with grid to split them
+            split_gdf = gpd.overlay(limitation_full, grid_gdf, how='intersection')
+            try:
+                split_gdf = split_gdf.explode(index_parts=False)
+            except TypeError:
+                split_gdf = split_gdf.explode().reset_index(drop=True)
+            # Keep consistent columns and continue downstream with split geometries
+            # split_gdf = split_gdf[['gid', 'geom', 'cell_id']]
+            limitation_full = split_gdf
+            
+            # Save merged limitations
+            region_shortname = get_region_shortname(region)
+            if region_shortname is None:
+                region_shortname = "region"
+            limitation_full.to_file(
+                f"result/{region_shortname}_limitations.gpkg",
+                layer=f"{region_shortname}_limitation_full"
+            )
+        ############################################
     # Ничего не возвращаем: результаты сохранены на диск
-    return None
+    # return None
+
+    ###############arable###########################
+    ######ARABLE выдает ошибку на буферах
+    arable_gdc = arable_gdc[arable_gdc['area_ha'] > 10].copy()
+    if not arable_gdc.empty:
+        arable_buffers_geom = calculate_geod_buffers(
+            i_gdf=arable_gdc,
+            buffer_crs='utm',
+            buffer_dist_source='value',
+            buffer_distance=20,
+            geom_field='geometry'
+        )
+        arable_buffer = arable_gdc.copy()
+        arable_buffer = arable_buffer.set_geometry(arable_buffers_geom)
+        arable_union = arable_gdc.geometry.unary_union
+        arable_buffer = arable_buffer.set_geometry(
+            arable_buffer.geometry.difference(arable_union)
+        )
+        arable_buffer = arable_buffer[~arable_buffer.geometry.is_empty].copy()
+    else:
+        arable_buffer = gpd.GeoDataFrame(columns=arable_gdc.columns, geometry=arable_gdc.geometry.name, crs=arable_gdc.crs)
     
+    arable_buffer.to_file(
+        f"result/{region_shortname}_limitations.gpkg",
+        layer=f"{region_shortname}_arable_buffer"
+    )
+    pass
+    
+
+def prepare_road_limitations(
+    postgres_info='.secret/.gdcdb',
+    region='Липецкая область', 
+    regions_table='admin.hse_russia_regions',
+    region_buf_size=5000,
+    road_table='osm.gis_osm_roads_free',
+    road_buf_size_rule={
+        "fclass  in  ('primary', 'primary_link')": 80,
+        "fclass in ('motorway' , 'motorway_link')": 80,
+        "fclass in ('secondary', 'secondary_link')": 70,
+        "fclass in ('tertiary', 'tertiary_link')": 70,
+        "fclass in ('trunk', 'trunk_link')": 70,
+        "fclass in ('unclassified')": 70,
+    },
+    road_buffer_crs='utm',
+):
+    try:
+        with open(postgres_info, encoding='utf-8') as f:
+            pg = json.load(f)
+    except:
+        raise
+    try:
+        engine = sqlalchemy.create_engine(
+            f"postgresql+psycopg2://{pg['user']}:{pg['password']}@{pg['host']}:{pg['port']}/{pg['database']}",
+            connect_args={
+                "sslmode": "verify-full",
+                "target_session_attrs": "read-write"
+            },
+        )
+    except:
+        raise
+    try:
+        sql = f"select * from {regions_table} where lower(region) = '{region.lower()}';"
+        with engine.connect() as conn:
+            region_gdf = gpd.read_postgis(sql, conn)
+        if region_buf_size > 0:
+            region_buffer = calculate_geod_buffers(region_gdf, 'laea', 'value', region_buf_size, geom_field='geom')
+            region_gdf = region_gdf.set_geometry(region_buffer)
+        
+        sql = f"select * from {road_table} road " \
+            f"where (ST_Intersects(" \
+            f"(select ST_Buffer(geom::geography, {region_buf_size})::geometry from {regions_table} where lower(region) = '{region.lower()}' limit 1), " \
+            f"road.geom" \
+            f")) " \
+            f"and ((road.fclass in ('primary', 'primary_link', 'secondary', 'secondary_link', 'tertiary', 'tertiary_link', 'trunk', 'trunk_link', 'motorway', 'motorway_link')) or (road.fclass = 'unclassified' and road.ref !~ ' .*'));"
+
+        with engine.connect() as conn:
+            road_gdf = gpd.read_postgis(sql, conn)
+
+        # Calculate buffer size per road based on provided rules
+        # Prefer 'fname' if available, otherwise use 'fclass'
+        match_field = 'fclass'
+        if match_field not in road_gdf.columns:
+            raise RuntimeError(
+                f"'fclass' not exists in {road_table}; available columns: {list(road_gdf.columns)}"
+            )
+
+        # Initialize column
+        road_gdf['buf_size'] = np.nan
+
+        # Parse rule keys like "fclass in ('primary','secondary')" or "fclass = 'unclassified'"
+        token_re = re.compile(r"'([^']+)'")
+        for rule, size in road_buf_size_rule.items():
+            # Extract all quoted tokens
+            tokens = token_re.findall(rule)
+            if tokens:
+                mask = road_gdf[match_field].isin(tokens)
+                road_gdf.loc[mask, 'buf_size'] = size
+            else:
+                # Fallback: if rule text directly equals a single value (no quotes), try exact match
+                value = rule.strip()
+                if value:
+                    road_gdf.loc[road_gdf[match_field] == value, 'buf_size'] = size
+
+        # Convert to nullable integer type if possible
+        try:
+            road_gdf['buf_size'] = road_gdf['buf_size'].astype('Int64')
+        except Exception:
+            pass
+        # Build per-feature buffers using buf_size field
+        road_buffers = calculate_geod_buffers(
+            i_gdf=road_gdf,
+            buffer_crs=road_buffer_crs,
+            buffer_dist_source='field',
+            buffer_distance='buf_size',
+            geom_field='geom'
+        )
+        road_OSM_cover_buf = road_gdf.copy()
+        road_OSM_cover_buf = road_OSM_cover_buf.set_geometry(road_buffers)
+        
+        # # Union all buffer geometries and explode to individual parts
+        # unioned = road_OSM_cover_buf.union_all()
+        # parts = gpd.GeoSeries(unioned, crs=road_OSM_cover_buf.crs).explode(index_parts=False)
+        # road_OSM_cover_buf = gpd.GeoDataFrame(geometry=parts, crs=road_OSM_cover_buf.crs).reset_index(drop=True)
+    except:
+        raise
+    pass
+
+    if not road_OSM_cover_buf.empty:
+        region_shortname = get_region_shortname(region)
+        road_OSM_cover_buf = road_OSM_cover_buf.set_geometry(road_OSM_cover_buf.geometry.make_valid())
+        road_OSM_cover_buf = road_OSM_cover_buf.clip(region_gdf)
+        # forest_gdf = forest_gdf.dissolve(by=['vmr'], dropna=False)
+        road_OSM_cover_buf = road_OSM_cover_buf.dissolve(dropna=False)
+        road_OSM_cover_buf = road_OSM_cover_buf.explode()
+        road_OSM_cover_buf.to_file(
+            # 'result/forest_limitations.gpkg', 
+            f"result/{region_shortname}_limitations.gpkg", 
+            layer=f"{region_shortname}_road_OSM_cover_buf"
+        )
+        return road_OSM_cover_buf
+    return None
+
 
 
 def prepare_limitations(
@@ -1220,7 +1481,7 @@ def prepare_limitations(
         forest_table=forest_table,
         region_buf_size=region_buf_size
     )
-    
+
     # Merge all limitations into a single GeoDataFrame
     src_gdfs = [
         ("water_poly", water_poly),
@@ -1315,10 +1576,7 @@ def prepare_limitations(
         return merged_gdf
     return None
 
-
-
-
-
+    
 if __name__ == '__main__':
     # prepare_water_limitations(
     #     region='Липецкая область',
@@ -1359,7 +1617,7 @@ if __name__ == '__main__':
     #     region='Липецкая область'
     # )
         
-    # prepare_limitations(
+    # limitations_all = prepare_limitations(
     #     region='Липецкая область',
     #     postgres_info='.secret/.gdcdb',
     #     regions_table='admin.hse_russia_regions',
@@ -1382,8 +1640,28 @@ if __name__ == '__main__':
     # )
 
     # download_from_y_obj_storage()
-
+    limitations_all = gpd.read_file(
+        'result/Lipetskaya_limitations.gpkg', 
+        layer='Lipetskaya_all_limitations'
+        )
     calculate_forest_belt(
         region='Липецкая область',
-        lulc_link='lulc/S2LULC_10m_LAEA_48_202507081046_sample.tif'
+        limitations_all=limitations_all,   # geodataframe derived from prepare_limitations
+        lulc_link='lulc/S2LULC_10m_LAEA_48_202507081046_sample.tif',
+        postgres_info='.secret/.gdcdb',
+        regions_table='admin.hse_russia_regions',
+        region_buf_size=5000,
+        road_table='osm.gis_osm_roads_free',
+        road_buf_size_rule={
+            "fclass  in  ('primary', 'primary_link')": 80,
+            "fclass in ('motorway' , 'motorway_link')": 80,
+            "fclass in ('secondary', 'secondary_link')": 70,
+            "fclass in ('tertiary', 'tertiary_link')": 70,
+            "fclass in ('trunk', 'trunk_link')": 70,
+            "fclass in ('unclassified')": 70,
+        }
     )
+
+    # prepare_road_limitations(
+    #     region='Липецкая область'
+    # )
