@@ -14,6 +14,7 @@ dependencies = [
     "pyjwt>=2.10.1",
     "pyproj>=3.7.1",
     "rasterio>=1.4.3",
+    "scipy>=1.15.3",
     "sqlalchemy>=2.0.43",
     "tqdm>=4.67.1",
     "vgdb-general",

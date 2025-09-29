@@ -15,6 +15,8 @@ import rasterio.features
 import numpy as np
 from tqdm import tqdm
 import math
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
 
 # Сложности https://github.com/astral-sh/uv/issues/11466
 from osgeo import gdal
@@ -24,6 +26,22 @@ from osgeo_utils import gdal_calc
 # import requests
 # import yadisk
 import boto3
+
+
+def drop_small_holes(poly, min_hole_area):
+    if poly.geom_type != "Polygon":
+        return poly
+    # keep only holes with area >= threshold
+    keep_holes = [r for r in poly.interiors if shapely.geometry.Polygon(r).area >= min_hole_area]
+    return shapely.geometry.Polygon(poly.exterior, keep_holes)
+
+
+def drop_small_holes_any(geom, min_hole_area):
+    if geom.geom_type == "Polygon":
+        return drop_small_holes(geom, min_hole_area)
+    if geom.geom_type == "MultiPolygon":
+        return shapely.geometry.MultiPolygon([drop_small_holes(p, min_hole_area) for p in geom.geoms])
+    return geom
 
 
 def get_y_token(yinfo='.secret/.yinfo'):
@@ -243,7 +261,7 @@ def calculate_geod_buffers(
     """_summary_
 
     Args:
-        i_gdf (gpd.GeoDataFrame): входной набор данных
+        i_gdf (gpd.GeoDataFrame): входной набор данных (геометрия в WGS-1984)
         buffer_crs (str): проекция для расчета буфера: 'utm' или 'laea'
         buffer_dist_source (str): источник значения размера буфера: 'field' (столбец в датафрейме) или 'value' (фикс значение)
         buffer_distance: в зависимости от значения buffer_dist_source - название столбца (str) или фикс значение (float)
@@ -277,16 +295,19 @@ def calculate_geod_buffers(
         transformer1 = Transformer.from_crs(4326, buf_crs, always_xy=True)
         transformer2 = Transformer.from_crs(buf_crs, 4326, always_xy=True)
         # вычисление буфера в текущей проекции UTM
-        if buffer_dist_source == 'value':
-            buffer = shapely.buffer(shapely.transform(row[geom_field], transformer1.transform, interleaved=False), float(buffer_distance))
-        elif buffer_dist_source == 'field':
-            buffer = shapely.buffer(shapely.transform(row[geom_field], transformer1.transform, interleaved=False), float(row[buffer_distance]))
-        else:
-            raise ValueError("Неверно задан параметр buffer_dist_source")
-        # Пересчет буфера обратно в WGS-1984
-        buffer = shapely.transform(buffer, transformer2.transform, interleaved=False)
-        # Добавить результат в список
-        buffer_geom.append(buffer)
+        try:
+            if buffer_dist_source == 'value':
+                buffer = shapely.buffer(shapely.transform(row[geom_field], transformer1.transform, interleaved=False), float(buffer_distance))
+            elif buffer_dist_source == 'field':
+                buffer = shapely.buffer(shapely.transform(row[geom_field], transformer1.transform, interleaved=False), float(row[buffer_distance]))
+            else:
+                raise ValueError("Неверно задан параметр buffer_dist_source")
+            # Пересчет буфера обратно в WGS-1984
+            buffer = shapely.transform(buffer, transformer2.transform, interleaved=False)
+            # Добавить результат в список
+            buffer_geom.append(buffer)
+        except Exception as e:
+            print(f"Failed to calculate buffer: {e}")
     return buffer_geom
 
 
@@ -1110,6 +1131,12 @@ def calculate_forest_belt(
         arable_gdc = lulc_gdc[lulc_gdc['name'] == 'arable'].copy()
         build_gdc = lulc_gdc[lulc_gdc['name'] == 'build'].copy()
 
+        water_gdc = water_gdc.to_crs(4326)
+        forest_gdc = forest_gdc.to_crs(4326)
+        meadow_gdc = meadow_gdc.to_crs(4326)
+        arable_gdc = arable_gdc.to_crs(4326)
+        build_gdc = build_gdc.to_crs(4326)
+
         # Удалить из лесов объекты площадью <= 0.1 га
         forest_gdc = forest_gdc[forest_gdc['area_ha'] > 0.1].copy()
         
@@ -1250,12 +1277,10 @@ def calculate_forest_belt(
                 layer=f"{region_shortname}_limitation_full"
             )
         ############################################
-    # Ничего не возвращаем: результаты сохранены на диск
-    # return None
 
     ###############arable###########################
-    ######ARABLE выдает ошибку на буферах
     arable_gdc = arable_gdc[arable_gdc['area_ha'] > 10].copy()
+    # arable_gdc = arable_gdc.to_crs(4326)
     if not arable_gdc.empty:
         arable_buffers_geom = calculate_geod_buffers(
             i_gdf=arable_gdc,
@@ -1278,7 +1303,125 @@ def calculate_forest_belt(
         f"result/{region_shortname}_limitations.gpkg",
         layer=f"{region_shortname}_arable_buffer"
     )
-    pass
+
+    ####################буферные зоны - начало######################
+    # вырезать буферные зоны по слою meadow 
+    arable_buffer_lim = gpd.clip(arable_buffer, meadow_gdc)
+    # cтереть участки, пересекающиеся с limitation_full
+    arable_buffer_lim = gpd.overlay(arable_buffer_lim, limitation_full, how='difference')
+    # разбить составные на отдельные объекты
+    arable_buffer_lim = arable_buffer_lim.explode()
+    # сохраняем в arable_buffer_lim
+    arable_buffer_lim.to_file(
+        f"result/{region_shortname}_limitations.gpkg",
+        layer=f"{region_shortname}_arable_buffer_lim"
+    )
+    # агрегироание
+    # arable_buffer_lim_tmp_buffer_geom = calculate_geod_buffers(
+    #     i_gdf=arable_buffer_lim,
+    #     buffer_crs='laea',
+    #     buffer_dist_source='value',
+    #     buffer_distance=7.5,
+    #     geom_field='geometry'
+    # )
+    # arable_buffer_lim_tmp_buffer = arable_buffer_lim.set_geometry(arable_buffer_lim_tmp_buffer_geom)
+    # arable_buffer_lim_tmp_buffer = arable_buffer_lim_tmp_buffer.dissolve()
+    # arable_buffer_lim_tmp_buffer = arable_buffer_lim_tmp_buffer.explode()
+    # arable_buffer_aggregate_geom = calculate_geod_buffers(
+    #     i_gdf=arable_buffer_lim_tmp_buffer,
+    #     buffer_crs='laea',
+    #     buffer_dist_source='value',
+    #     buffer_distance=-7.5,
+    #     geom_field='geometry'
+    # )
+    # arable_buffer_aggregate = arable_buffer_lim_tmp_buffer.set_geometry(arable_buffer_aggregate_geom)
+    # arable_buffer_aggregate = arable_buffer_aggregate.dissolve()
+    # arable_buffer_aggregate = arable_buffer_aggregate.explode()
+    minx, miny, maxx, maxy = arable_buffer_lim.total_bounds
+    distance_crs = crs.CRS.from_proj4(
+        f"+proj=laea +lat_0={(miny + maxy) / 2} +lon_0={(minx + maxx) / 2} " \
+        f"+x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"
+    )
+    arable_buffer_aggregate = arable_buffer_lim.to_crs(distance_crs)
+    
+    arable_buffer_aggregate = arable_buffer_aggregate.reset_index(drop=True)
+    
+    pairs = arable_buffer_aggregate.sjoin(
+        arable_buffer_aggregate,
+        predicate="dwithin",
+        distance=15,
+        how="left"
+    )
+    pairs = pairs.dropna(subset=["index_right"])
+    pairs["index_right"] = pairs["index_right"].astype(int)
+    pairs = pairs[pairs.index != pairs["index_right"]]
+    
+    rows = pairs.index.to_numpy()
+    cols = pairs["index_right"].to_numpy()
+    graph = coo_matrix((np.ones_like(rows), (rows, cols)), shape=(len(arable_buffer_aggregate), len(arable_buffer_aggregate)))
+    _, labels = connected_components(graph)
+    arable_buffer_aggregate["cluster_id"] = labels
+    arable_buffer_aggregate = arable_buffer_aggregate.dissolve(by="cluster_id")
+    # arable_buffer_aggregate = arable_buffer_aggregate.explode()
+    arable_buffer_aggregate = arable_buffer_aggregate.to_crs(4326)
+    
+    geod = Geod(ellps='WGS84')
+    areas_ha = []
+    for geom in arable_buffer_aggregate.geometry:
+        if geom is None or geom.is_empty:
+            areas_ha.append(0.0)
+            continue
+        try:
+            area_m2, _ = geod.geometry_area_perimeter(geom)
+            areas_ha.append(abs(area_m2) / 10000.0)
+        except Exception:
+            areas_ha.append(0.0)
+    arable_buffer_aggregate['area_ha'] = pd.to_numeric(areas_ha, errors='coerce')
+
+    # Удалить объекты площадью <= 0.1 га
+    arable_buffer_aggregate = arable_buffer_aggregate[arable_buffer_aggregate['area_ha'] > 0.1].copy()
+
+    arable_buffer_aggregate.to_file(
+        f"result/{region_shortname}_limitations.gpkg",
+        layer=f"{region_shortname}_arable_buffer_aggregate"
+    )
+
+    # PAEK-like smoothing: project to metric CRS, buffer-debuffer, project back
+    if not arable_buffer_aggregate.empty:
+        smooth_tolerance = 5  # meters
+        g_proj = arable_buffer_aggregate.to_crs(distance_crs)
+        
+        g_proj["geometry"] = g_proj.buffer(smooth_tolerance).buffer(-smooth_tolerance)
+        arable_buffer_smooth = g_proj.to_crs(4326)
+
+        # Recompute area after smoothing
+        geod = Geod(ellps='WGS84')
+        areas_ha = []
+        for geom in arable_buffer_smooth.geometry:
+            if geom is None or geom.is_empty:
+                areas_ha.append(0.0)
+                continue
+            try:
+                area_m2, _ = geod.geometry_area_perimeter(geom)
+                areas_ha.append(abs(area_m2) / 10000.0)
+            except Exception:
+                areas_ha.append(0.0)
+        arable_buffer_smooth['area_ha'] = pd.to_numeric(areas_ha, errors='coerce')
+        arable_buffer_smooth.to_file(
+            f"result/{region_shortname}_limitations.gpkg",
+            layer=f"{region_shortname}_arable_buffer_smooth"
+        )
+
+    # Удаляем пустоты внутри полигонов, критерий – площадь 0,5 га
+    arable_buffer_eliminate = arable_buffer_smooth.to_crs(distance_crs)
+    arable_buffer_eliminate["geometry"] = arable_buffer_eliminate.geometry.apply(lambda g: drop_small_holes_any(g, min_hole_area=5000))  # CRS units
+    arable_buffer_eliminate = arable_buffer_eliminate.to_crs(4326)
+    arable_buffer_eliminate.to_file(
+        f"result/{region_shortname}_limitations.gpkg",
+        layer=f"{region_shortname}_arable_buffer_eliminate"
+    )
+
+    ####################буферные зоны - конец#######################
     
 
 def prepare_road_limitations(
