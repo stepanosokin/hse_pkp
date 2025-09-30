@@ -11,12 +11,13 @@ import sqlalchemy
 from zipfile import ZipFile
 import os
 import rasterio
-import rasterio.features
 import numpy as np
 from tqdm import tqdm
 import math
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
+from skimage.morphology import skeletonize
+from centerline.geometry import Centerline
 
 # Сложности https://github.com/astral-sh/uv/issues/11466
 from osgeo import gdal
@@ -24,7 +25,7 @@ from osgeo import gdal_array
 from osgeo_utils import gdal_calc
 # from vgdb_general import smart_http_request
 # import requests
-# import yadisk
+import yadisk
 import boto3
 
 
@@ -1418,6 +1419,232 @@ def belt_calculate_arable_buffer_eliminate(
     return arable_buffer_eliminate
 
 
+def belt_calculate_skeletons(
+    region='Липецкая область',
+    polygons_gdf=None,
+    pixel_size_m=1.0,
+    min_branch_length_m=0.1
+):
+    # Raster-skeletonize polygons and return centerlines as a GeoDataFrame.
+    # Steps:
+    # 1) Project to local metric CRS (LAEA centered on bbox)
+    # 2) Rasterize polygons at fixed pixel size
+    # 3) Skeletonize raster (thinning)
+    # 4) Convert skeleton pixels to line segments (4-neighborhood), merge, prune
+    # 5) Save to GeoPackage and return
+
+    if polygons_gdf is None or polygons_gdf.empty:
+        return gpd.GeoDataFrame(geometry=[], crs=4326)
+
+    region_shortname = get_region_shortname(region)
+    if region_shortname is None:
+        region_shortname = "region"
+
+    # Choose local metric CRS (LAEA) centered at polygon extent
+    minx, miny, maxx, maxy = polygons_gdf.total_bounds
+    distance_crs = crs.CRS.from_proj4(
+        f"+proj=laea +lat_0={(miny + maxy) / 2} +lon_0={(minx + maxx) / 2} "
+        f"+x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"
+    )
+
+    # Parameters
+    pixel_size_m = pixel_size_m  # meters per pixel
+    min_branch_length_m = min_branch_length_m  # prune very short segments
+
+    g_proj = polygons_gdf.to_crs(distance_crs)
+    gxmin, gymin, gxmax, gymax = g_proj.total_bounds
+    if not np.isfinite([gxmin, gymin, gxmax, gymax]).all():
+        return gpd.GeoDataFrame(geometry=[], crs=4326)
+
+    # Compute raster grid size
+    width = max(1, int(math.ceil((gxmax - gxmin) / pixel_size_m)))
+    height = max(1, int(math.ceil((gymax - gymin) / pixel_size_m)))
+
+    # Build affine transform (origin at top-left)
+    transform = rasterio.transform.from_origin(gxmin, gymax, pixel_size_m, pixel_size_m)
+
+    # Rasterize polygons to a binary mask (1 inside polygon)
+    shapes = [(geom, 1) for geom in g_proj.geometry if geom and not geom.is_empty]
+    if not shapes:
+        return gpd.GeoDataFrame(geometry=[], crs=4326)
+
+    mask = rasterio.features.rasterize(
+        shapes=shapes,
+        out_shape=(height, width),
+        transform=transform,
+        fill=0,
+        all_touched=False,
+        dtype="uint8",
+    )
+
+    # Skeletonize (boolean array where True is foreground)
+    sk = skeletonize(mask.astype(bool))
+
+    # Convert skeleton pixels to line segments by connecting 4-neighbors (right, down)
+    segments = []
+    def pix_center(col, row):
+        x = gxmin + (col + 0.5) * pixel_size_m
+        y = gymax - (row + 0.5) * pixel_size_m
+        return (x, y)
+
+    H, W = sk.shape
+    for r in range(H):
+        row = sk[r]
+        for c in range(W):
+            if not row[c]:
+                continue
+            # right neighbor
+            if c + 1 < W and sk[r, c + 1]:
+                p0 = pix_center(c, r)
+                p1 = pix_center(c + 1, r)
+                segments.append(shapely.geometry.LineString([p0, p1]))
+            # down neighbor
+            if r + 1 < H and sk[r + 1, c]:
+                p0 = pix_center(c, r)
+                p1 = pix_center(c, r + 1)
+                segments.append(shapely.geometry.LineString([p0, p1]))
+
+    if not segments:
+        return gpd.GeoDataFrame(geometry=[], crs=4326)
+
+    # Merge segments into lines
+    seg_series = gpd.GeoSeries(segments, crs=distance_crs)
+    merged = shapely.line_merge(seg_series.unary_union)
+
+    # Normalize to iterable of lines
+    lines = []
+    if merged is None or merged.is_empty:
+        return gpd.GeoDataFrame(geometry=[], crs=4326)
+    if merged.geom_type == "LineString":
+        lines = [merged]
+    elif merged.geom_type == "MultiLineString":
+        lines = list(merged.geoms)
+    else:
+        # Fallback: explode geometries we can iterate
+        try:
+            lines = list(merged.geoms)
+        except Exception:
+            lines = []
+
+    # Prune short branches (by metric length)
+    lines = [ln for ln in lines if ln.length >= min_branch_length_m]
+    if not lines:
+        return gpd.GeoDataFrame(geometry=[], crs=4326)
+
+    skeleton_gdf = gpd.GeoDataFrame(geometry=lines, crs=distance_crs)
+    # Clip to input polygons (to remove rasterization outside effects)
+    try:
+        skeleton_gdf = gpd.overlay(skeleton_gdf, g_proj[[g_proj.geometry.name]], how="intersection")
+    except Exception:
+        # If overlay fails (topology issues), fall back to clip
+        try:
+            skeleton_gdf = gpd.clip(skeleton_gdf, g_proj)
+        except Exception:
+            pass
+
+    # Reproject back to WGS84 for output
+    skeleton_out = skeleton_gdf.to_crs(4326)
+
+    # Save
+    try:
+        out_path = os.path.join("result", f"{region_shortname}_limitations.gpkg")
+        layer_name = f"{region_shortname}_arable_buffer_line"
+        skeleton_out.to_file(out_path, layer=layer_name)
+    except Exception as e:
+        print(f"Warning: failed to save skeletons to GeoPackage: {e}")
+
+    return skeleton_out
+
+
+def belt_calculate_centerlines(
+    region='Липецкая область',
+    polygons_gdf=None,
+    segmentize_maxlen_m = 1.0,   # densify polygon boundary before centerline
+    min_branch_length_m = 0.1   # prune tiny spurs
+):
+    # Compute vector centerlines using the 'centerline' library.
+    # 1) Project polygons to a local metric CRS (LAEA centered on bbox)
+    # 2) For each Polygon in the GeoDataFrame (explode MultiPolygons), compute Centerline
+    # 3) Collect LineStrings/MultiLineStrings, prune shorts, clip back and save
+
+    if polygons_gdf is None or polygons_gdf.empty:
+        return gpd.GeoDataFrame(geometry=[], crs=4326)
+
+    region_shortname = get_region_shortname(region)
+    if region_shortname is None:
+        region_shortname = "region"
+
+    # Local metric CRS (LAEA centered on dataset bbox)
+    minx, miny, maxx, maxy = polygons_gdf.total_bounds
+    distance_crs = crs.CRS.from_proj4(
+        f"+proj=laea +lat_0={(miny + maxy) / 2} +lon_0={(minx + maxx) / 2} "
+        f"+x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"
+    )
+
+    g_proj = polygons_gdf.to_crs(distance_crs)
+    if g_proj.empty:
+        return gpd.GeoDataFrame(geometry=[], crs=4326)
+
+    # Parameters
+    segmentize_maxlen_m = segmentize_maxlen_m   # densify polygon boundary before centerline
+    min_branch_length_m = min_branch_length_m  # prune tiny spurs
+
+    # Ensure simple polygons only
+    g_exploded = g_proj.explode(ignore_index=True)
+
+    lines = []
+    for geom in g_exploded.geometry:
+        if geom is None or geom.is_empty:
+            continue
+        if geom.geom_type != "Polygon":
+            # Skip non-polygon geometry
+            continue
+        try:
+            cl = Centerline(geom, segmentize_maxlen=segmentize_maxlen_m)
+            cl_geom = cl.geometry
+        except Exception:
+            continue
+        if cl_geom is None or cl_geom.is_empty:
+            continue
+        if cl_geom.geom_type == "LineString":
+            lines.append(cl_geom)
+        elif cl_geom.geom_type == "MultiLineString":
+            lines.extend(list(cl_geom.geoms))
+
+    if not lines:
+        return gpd.GeoDataFrame(geometry=[], crs=4326)
+
+    # Build GeoDataFrame in metric CRS
+    lines_gdf = gpd.GeoDataFrame(geometry=lines, crs=distance_crs)
+    # Prune short segments
+    lines_gdf = lines_gdf[lines_gdf.length >= min_branch_length_m].copy()
+    if lines_gdf.empty:
+        return gpd.GeoDataFrame(geometry=[], crs=4326)
+
+    # Clip to polygons to be safe
+    try:
+        lines_gdf = gpd.overlay(lines_gdf, g_proj[[g_proj.geometry.name]], how="intersection")
+    except Exception:
+        try:
+            lines_gdf = gpd.clip(lines_gdf, g_proj)
+        except Exception:
+            pass
+
+    # Back to WGS84
+    out_gdf = lines_gdf.to_crs(4326)
+
+    # Save result
+    try:
+        out_path = os.path.join("result", f"{region_shortname}_limitations.gpkg")
+        layer_name = f"{region_shortname}_arable_buffer_line_centerline"
+        out_gdf.to_file(out_path, layer=layer_name)
+    except Exception as e:
+        print(f"Warning: failed to save centerlines: {e}")
+
+    return out_gdf
+
+
+
 def calculate_forest_belt(
     region='Липецкая область',
     limitations_all=None,   # geodataframe derived from prepare_limitations
@@ -1622,7 +1849,6 @@ def prepare_road_limitations(
         )
         return road_OSM_cover_buf
     return None
-
 
 
 def prepare_limitations(
@@ -1896,7 +2122,10 @@ if __name__ == '__main__':
         'result/Lipetskaya_Limitations.gpkg', 
         layer='Lipetskaya_limitation_full'
         )
-    
+    arable_buffer_eliminate = gpd.read_file(
+        'result/Lipetskaya_Limitations.gpkg', 
+        layer='Lipetskaya_arable_buffer_eliminate'
+        )
     # calculate_forest_belt(
     #     region='Липецкая область',
     #     limitations_all=limitations_all,   # geodataframe derived from prepare_limitations
@@ -1929,11 +2158,25 @@ if __name__ == '__main__':
     #     arable_buffer_distance=20
     # )
 
-    belt_calculate_arable_buffer_eliminate(
+    # arable_buffer_eliminate = belt_calculate_arable_buffer_eliminate(
+    #     region='Липецкая область',
+    #     arable_buffer=arable_buffer,
+    #     meadow_gdf=meadow_gdf,
+    #     limitation_full=limitation_full
+    # )
+
+    # arable_buffer_line = belt_calculate_skeletons(
+    #     region='Липецкая область',
+    #     polygons_gdf=arable_buffer_eliminate,
+    #     pixel_size_m=1,
+    #     min_branch_length_m=0.1
+    # )
+
+    arable_buffer_line = belt_calculate_centerlines(
         region='Липецкая область',
-        arable_buffer=arable_buffer,
-        meadow_gdf=meadow_gdf,
-        limitation_full=limitation_full
+        polygons_gdf=arable_buffer_eliminate,
+        segmentize_maxlen_m = 1.0,   # densify polygon boundary before centerline
+        min_branch_length_m = 0.1   # prune tiny spurs
     )
 
     pass
