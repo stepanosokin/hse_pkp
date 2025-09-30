@@ -1415,6 +1415,7 @@ def belt_calculate_arable_buffer_eliminate(
         f"result/{region_shortname}_limitations.gpkg",
         layer=f"{region_shortname}_arable_buffer_eliminate"
     )
+    return arable_buffer_eliminate
 
 
 def calculate_forest_belt(
@@ -1867,7 +1868,6 @@ if __name__ == '__main__':
     #     forest_table='forest.pkp_forest_glf'
     # )
 
-    # download_from_y_obj_storage()
     limitations_all = gpd.read_file(
         'result/Lipetskaya_limitations.gpkg', 
         layer='Lipetskaya_all_limitations'
@@ -1915,13 +1915,12 @@ if __name__ == '__main__':
     #     }
     # )
 
-    # limitations_full = belt_merge_limitation_full(
+    # limitation_full = belt_merge_limitation_full(
     #     region='Липецкая область',
     #     limitations_all=limitations_all,   # geodataframe derived from prepare_limitations
     #     road_OSM_cover_buf=road_OSM_cover_buf,   # geodataframe derived from calculate_road_buffer
     #     forest_50m=forest_50m   # geodataframe derived from calculate_forest_buffer
     # )
-    pass
 
     # arable_buffer = belt_calculate_arable_buffer(
     #     region='Липецкая область',
