@@ -1168,109 +1168,12 @@ def belt_calculate_forest_buffer(
     return False
 
 
-def calculate_forest_belt(
+def belt_merge_limitation_full(
     region='Липецкая область',
     limitations_all=None,   # geodataframe derived from prepare_limitations
-    lulc_link='lulc/S2LULC_10m_LAEA_48_202507081046.tif',
-    postgres_info='.secret/.gdcdb',
-    regions_table='admin.hse_russia_regions',
-    region_buf_size=5000,
-    road_table='osm.gis_osm_roads_free',
-    road_buf_size_rule={
-        "fclass  in  ('primary', 'primary_link')": 80,
-        "fclass in ('motorway' , 'motorway_link')": 80,
-        "fclass in ('secondary', 'secondary_link')": 70,
-        "fclass in ('tertiary', 'tertiary_link')": 70,
-        "fclass in ('trunk', 'trunk_link')": 70,
-        "fclass in ('unclassified')": 70,
-    },
+    road_OSM_cover_buf=None,   # geodataframe derived from calculate_road_buffer
+    forest_50m=None,   # geodataframe derived from calculate_forest_buffer
 ):
-    region_shortname = get_region_shortname(region)
-    if region_shortname is None:
-        region_shortname = "region"
-    current_dir = os.getcwd()
-    os.environ["PROJ_LIB"] = os.path.join(current_dir, '.venv', 'Lib', 'site-packages', 'osgeo', 'data', 'proj')
-    lulcdir = os.path.join(current_dir, 'lulc')
-    if not os.path.isdir(lulcdir):
-        os.mkdir(lulcdir)
-    
-    ######################LULC######################
-    try:
-        lulc_gdfs = belt_vectorize_lulc(
-            region=region,
-            lulc_link=lulc_link
-            )
-        
-        water_gdf = lulc_gdfs.get('water_gdf')
-        forest_gdf = lulc_gdfs.get('forest_gdf')
-        meadow_gdf = lulc_gdfs.get('meadow_gdf')
-        arable_gdf = lulc_gdfs.get('arable_gdf')
-        build_gdf = lulc_gdfs.get('build_gdf')
-
-        for name, lulc_gdf in lulc_gdfs.items():
-            lulc_gdf.to_file(
-                os.path.join(current_dir, 'result', f'{region_shortname}_lulc.gpkg'), 
-                layer=f"{region_shortname}_lulc_{name.replace('_gdf', '')}"
-                )
-        pass
-    except Exception as e:
-        raise RuntimeError(f"Failed to build/save classified LULC GeoDataFrame: {e}")
-        
-        
-
-    ######################forest######################
-    forest_50m = belt_calculate_forest_buffer(
-        region=region,
-        forest_gdf=forest_gdf
-        )
-    # # Удалить из лесов объекты площадью <= 0.1 га
-    # try:
-    #     forest_gdf = forest_gdf[forest_gdf['area_ha'] > 0.1].copy()
-    #     # Построить геодезические буферы 50 м вокруг forest_gdf, объединить, взорвать и сохранить как forest_50m
-    #     if not forest_gdf.empty:
-    #         try:
-    #             # Буферы считаем в геодезическом режиме: сначала в WGS84, затем используем calculate_geod_buffers
-    #             forest_wgs = forest_gdf.to_crs(4326)
-    #             buffer_geom = calculate_geod_buffers(
-    #                 forest_wgs, buffer_crs='laea', buffer_dist_source='value', buffer_distance=50, geom_field='geometry'
-    #             )
-    #             forest_buf = forest_wgs.set_geometry(buffer_geom)
-    #             # Union all buffered parts
-    #             unioned = forest_buf.union_all()
-    #             forest_50m = gpd.GeoDataFrame(gpd.GeoSeries(unioned))
-    #             forest_50m = forest_50m.rename(columns={0: 'geometry'}).set_geometry('geometry')
-    #             forest_50m = forest_50m.set_crs('EPSG:4326')
-    #             # Explode to individual polygons
-    #             try:
-    #                 forest_50m = forest_50m.explode(index_parts=False)
-    #             except TypeError:
-    #                 forest_50m = forest_50m.explode().reset_index(drop=True)
-    #             # Save to GPKG as 'forest_50m'
-    #             # region_shortname = get_region_shortname(region)
-
-    #             forest_50m.to_file(f"result/{region_shortname}_limitations.gpkg", layer=f'{region_shortname}_forest_50m', driver='GPKG')
-            
-    #         except Exception as e:
-    #             raise RuntimeError(f"Failed to build/save forest_50m buffers: {e}")
-
-    #     # # Сохранение в lulc.gpkg с именем слоя <raster_name>_classified
-    #     # classified_layer = f"{layer_name}_classified"
-    #     # out_gpkg = os.path.join(result_dir, 'lulc.gpkg')
-    #     # lulc_gdc.to_file(out_gpkg, layer=classified_layer, driver='GPKG')
-    # except Exception as e:
-    #     raise RuntimeError(f"Failed to build/save classified LULC GeoDataFrame: {e}")
-
-    ######################road_OSM_cover_buf######################
-    road_OSM_cover_buf = prepare_road_limitations(
-        postgres_info=postgres_info,
-        region=region, 
-        regions_table=regions_table,
-        region_buf_size=region_buf_size,
-        road_table=road_table,
-        road_buf_size_rule=road_buf_size_rule,
-        road_buffer_crs='utm',
-    )
-
     ###################объединение ограничений########################
     if limitations_all is not None and road_OSM_cover_buf is not None and forest_50m is not None:
         ############################################
@@ -1360,34 +1263,63 @@ def calculate_forest_belt(
                 f"result/{region_shortname}_limitations.gpkg",
                 layer=f"{region_shortname}_limitation_full"
             )
-        ############################################
+            return limitation_full
+    return False
 
+
+def belt_calculate_arable_buffer(
+    region='Липецкая область',
+    arable_gdf=None,
+    arable_area_ha_threshold=10,
+    arable_buffer_distance=20,
+):
+    region_shortname = get_region_shortname(region)
+    if region_shortname is None:
+        region_shortname = "region"
     ###############arable###########################
-    arable_gdf = arable_gdf[arable_gdf['area_ha'] > 10].copy()
-    # arable_gdf = arable_gdf.to_crs(4326)
-    if not arable_gdf.empty:
-        arable_buffers_geom = calculate_geod_buffers(
-            i_gdf=arable_gdf,
-            buffer_crs='utm',
-            buffer_dist_source='value',
-            buffer_distance=20,
-            geom_field='geometry'
+    try:
+        arable_gdf = arable_gdf[arable_gdf['area_ha'] > arable_area_ha_threshold].copy()
+        # arable_gdf = arable_gdf.to_crs(4326)
+        if not arable_gdf.empty:
+            arable_buffers_geom = calculate_geod_buffers(
+                i_gdf=arable_gdf,
+                buffer_crs='utm',
+                buffer_dist_source='value',
+                buffer_distance=arable_buffer_distance,
+                geom_field='geometry'
+            )
+            arable_buffer = arable_gdf.copy()
+            arable_buffer = arable_buffer.set_geometry(arable_buffers_geom)
+            arable_union = arable_gdf.geometry.unary_union
+            arable_buffer = arable_buffer.set_geometry(
+                arable_buffer.geometry.difference(arable_union)
+            )
+            arable_buffer = arable_buffer[~arable_buffer.geometry.is_empty].copy()
+        else:
+            arable_buffer = gpd.GeoDataFrame(columns=arable_gdf.columns, geometry=arable_gdf.geometry.name, crs=arable_gdf.crs)
+        
+        arable_buffer.to_file(
+            f"result/{region_shortname}_limitations.gpkg",
+            layer=f"{region_shortname}_arable_buffer"
         )
-        arable_buffer = arable_gdf.copy()
-        arable_buffer = arable_buffer.set_geometry(arable_buffers_geom)
-        arable_union = arable_gdf.geometry.unary_union
-        arable_buffer = arable_buffer.set_geometry(
-            arable_buffer.geometry.difference(arable_union)
-        )
-        arable_buffer = arable_buffer[~arable_buffer.geometry.is_empty].copy()
-    else:
-        arable_buffer = gpd.GeoDataFrame(columns=arable_gdf.columns, geometry=arable_gdf.geometry.name, crs=arable_gdf.crs)
-    
-    arable_buffer.to_file(
-        f"result/{region_shortname}_limitations.gpkg",
-        layer=f"{region_shortname}_arable_buffer"
-    )
+        return arable_buffer
+    except Exception as e:
+        raise RuntimeError(f"Failed to calculate arable buffer: {e}")
+    return False
 
+
+def belt_calculate_arable_buffer_eliminate(
+    region='Липецкая область',
+    arable_buffer=None,
+    meadow_gdf=None,
+    limitation_full=None,
+    arabale_buffer_aggregate_distance_m=15,
+    arable_buffer_aggregate_threshold_ha=0.1,   # минимальная площадь агрегированного участка
+    arable_hole_area_threshold_m=5000   # минимальная площадь дыры в агрегированном участке
+):
+    region_shortname = get_region_shortname(region)
+    if region_shortname is None:
+        region_shortname = "region"
     ####################буферные зоны - начало######################
     # вырезать буферные зоны по слою meadow 
     arable_buffer_lim = gpd.clip(arable_buffer, meadow_gdf)
@@ -1400,27 +1332,6 @@ def calculate_forest_belt(
         f"result/{region_shortname}_limitations.gpkg",
         layer=f"{region_shortname}_arable_buffer_lim"
     )
-    # агрегироание
-    # arable_buffer_lim_tmp_buffer_geom = calculate_geod_buffers(
-    #     i_gdf=arable_buffer_lim,
-    #     buffer_crs='laea',
-    #     buffer_dist_source='value',
-    #     buffer_distance=7.5,
-    #     geom_field='geometry'
-    # )
-    # arable_buffer_lim_tmp_buffer = arable_buffer_lim.set_geometry(arable_buffer_lim_tmp_buffer_geom)
-    # arable_buffer_lim_tmp_buffer = arable_buffer_lim_tmp_buffer.dissolve()
-    # arable_buffer_lim_tmp_buffer = arable_buffer_lim_tmp_buffer.explode()
-    # arable_buffer_aggregate_geom = calculate_geod_buffers(
-    #     i_gdf=arable_buffer_lim_tmp_buffer,
-    #     buffer_crs='laea',
-    #     buffer_dist_source='value',
-    #     buffer_distance=-7.5,
-    #     geom_field='geometry'
-    # )
-    # arable_buffer_aggregate = arable_buffer_lim_tmp_buffer.set_geometry(arable_buffer_aggregate_geom)
-    # arable_buffer_aggregate = arable_buffer_aggregate.dissolve()
-    # arable_buffer_aggregate = arable_buffer_aggregate.explode()
     minx, miny, maxx, maxy = arable_buffer_lim.total_bounds
     distance_crs = crs.CRS.from_proj4(
         f"+proj=laea +lat_0={(miny + maxy) / 2} +lon_0={(minx + maxx) / 2} " \
@@ -1433,7 +1344,7 @@ def calculate_forest_belt(
     pairs = arable_buffer_aggregate.sjoin(
         arable_buffer_aggregate,
         predicate="dwithin",
-        distance=15,
+        distance=arabale_buffer_aggregate_distance_m,
         how="left"
     )
     pairs = pairs.dropna(subset=["index_right"])
@@ -1463,7 +1374,7 @@ def calculate_forest_belt(
     arable_buffer_aggregate['area_ha'] = pd.to_numeric(areas_ha, errors='coerce')
 
     # Удалить объекты площадью <= 0.1 га
-    arable_buffer_aggregate = arable_buffer_aggregate[arable_buffer_aggregate['area_ha'] > 0.1].copy()
+    arable_buffer_aggregate = arable_buffer_aggregate[arable_buffer_aggregate['area_ha'] > arable_buffer_aggregate_threshold_ha].copy()
 
     arable_buffer_aggregate.to_file(
         f"result/{region_shortname}_limitations.gpkg",
@@ -1498,14 +1409,104 @@ def calculate_forest_belt(
 
     # Удаляем пустоты внутри полигонов, критерий – площадь 0,5 га
     arable_buffer_eliminate = arable_buffer_smooth.to_crs(distance_crs)
-    arable_buffer_eliminate["geometry"] = arable_buffer_eliminate.geometry.apply(lambda g: drop_small_holes_any(g, min_hole_area=5000))  # CRS units
+    arable_buffer_eliminate["geometry"] = arable_buffer_eliminate.geometry.apply(lambda g: drop_small_holes_any(g, min_hole_area=arable_hole_area_threshold_m))  # CRS units
     arable_buffer_eliminate = arable_buffer_eliminate.to_crs(4326)
     arable_buffer_eliminate.to_file(
         f"result/{region_shortname}_limitations.gpkg",
         layer=f"{region_shortname}_arable_buffer_eliminate"
     )
 
-    ####################буферные зоны - конец#######################
+
+def calculate_forest_belt(
+    region='Липецкая область',
+    limitations_all=None,   # geodataframe derived from prepare_limitations
+    lulc_link='lulc/S2LULC_10m_LAEA_48_202507081046.tif',
+    postgres_info='.secret/.gdcdb',
+    regions_table='admin.hse_russia_regions',
+    region_buf_size=5000,
+    road_table='osm.gis_osm_roads_free',
+    road_buf_size_rule={
+        "fclass  in  ('primary', 'primary_link')": 80,
+        "fclass in ('motorway' , 'motorway_link')": 80,
+        "fclass in ('secondary', 'secondary_link')": 70,
+        "fclass in ('tertiary', 'tertiary_link')": 70,
+        "fclass in ('trunk', 'trunk_link')": 70,
+        "fclass in ('unclassified')": 70,
+    },
+):
+    region_shortname = get_region_shortname(region)
+    if region_shortname is None:
+        region_shortname = "region"
+    current_dir = os.getcwd()
+    os.environ["PROJ_LIB"] = os.path.join(current_dir, '.venv', 'Lib', 'site-packages', 'osgeo', 'data', 'proj')
+    lulcdir = os.path.join(current_dir, 'lulc')
+    if not os.path.isdir(lulcdir):
+        os.mkdir(lulcdir)
+    
+    ######################LULC######################
+    try:
+        lulc_gdfs = belt_vectorize_lulc(
+            region=region,
+            lulc_link=lulc_link
+            )
+        
+        water_gdf = lulc_gdfs.get('water_gdf')
+        forest_gdf = lulc_gdfs.get('forest_gdf')
+        meadow_gdf = lulc_gdfs.get('meadow_gdf')
+        arable_gdf = lulc_gdfs.get('arable_gdf')
+        build_gdf = lulc_gdfs.get('build_gdf')
+
+        for name, lulc_gdf in lulc_gdfs.items():
+            lulc_gdf.to_file(
+                os.path.join(current_dir, 'result', f'{region_shortname}_lulc.gpkg'), 
+                layer=f"{region_shortname}_lulc_{name.replace('_gdf', '')}"
+                )
+        pass
+    except Exception as e:
+        raise RuntimeError(f"Failed to build/save classified LULC GeoDataFrame: {e}")
+        
+        
+
+    ######################forest######################
+    forest_50m = belt_calculate_forest_buffer(
+        region=region,
+        forest_gdf=forest_gdf
+        )
+
+    ######################road_OSM_cover_buf######################
+    road_OSM_cover_buf = prepare_road_limitations(
+        postgres_info=postgres_info,
+        region=region, 
+        regions_table=regions_table,
+        region_buf_size=region_buf_size,
+        road_table=road_table,
+        road_buf_size_rule=road_buf_size_rule,
+        road_buffer_crs='utm',
+    )
+
+    ###################объединение ограничений########################
+    limitation_full = belt_merge_limitation_full(
+        region=region,
+        limitations_all=limitations_all,   # geodataframe derived from prepare_limitations
+        road_OSM_cover_buf=road_OSM_cover_buf,   # geodataframe derived from calculate_road_buffer
+        forest_50m=forest_50m   # geodataframe derived from calculate_forest_buffer
+    )
+
+    ###############arable###########################
+    arable_buffer = belt_calculate_arable_buffer(
+        region=region,
+        arable_gdf=arable_gdf,
+        arable_area_ha_threshold=10,
+        arable_buffer_distance=20
+    )
+
+    ####################буферные зоны######################
+    arable_buffer_eliminate = belt_calculate_arable_buffer_eliminate(
+        region=region,
+        arable_buffer=arable_buffer,
+        meadow_gdf=meadow_gdf,
+        limitation_full=limitation_full
+    )
     
 
 def prepare_road_limitations(
@@ -1871,6 +1872,31 @@ if __name__ == '__main__':
         'result/Lipetskaya_limitations.gpkg', 
         layer='Lipetskaya_all_limitations'
         )
+    road_OSM_cover_buf = gpd.read_file(
+        'result/Lipetskaya_limitations.gpkg', 
+        layer='Lipetskaya_road_OSM_cover_buf'
+        )
+    forest_50m = gpd.read_file(
+        'result/Lipetskaya_limitations.gpkg', 
+        layer='Lipetskaya_forest_50m'
+        )
+    arable_gdf = gpd.read_file(
+        'result/Lipetskaya_lulc.gpkg', 
+        layer='Lipetskaya_lulc_arable'
+        )
+    arable_buffer = gpd.read_file(
+        'result/Lipetskaya_Limitations.gpkg', 
+        layer='Lipetskaya_arable_buffer'
+        )
+    meadow_gdf = gpd.read_file(
+        'result/Lipetskaya_lulc.gpkg', 
+        layer='Lipetskaya_lulc_meadow'
+        )
+    limitation_full = gpd.read_file(
+        'result/Lipetskaya_Limitations.gpkg', 
+        layer='Lipetskaya_limitation_full'
+        )
+    
     # calculate_forest_belt(
     #     region='Липецкая область',
     #     limitations_all=limitations_all,   # geodataframe derived from prepare_limitations
@@ -1889,6 +1915,29 @@ if __name__ == '__main__':
     #     }
     # )
 
+    # limitations_full = belt_merge_limitation_full(
+    #     region='Липецкая область',
+    #     limitations_all=limitations_all,   # geodataframe derived from prepare_limitations
+    #     road_OSM_cover_buf=road_OSM_cover_buf,   # geodataframe derived from calculate_road_buffer
+    #     forest_50m=forest_50m   # geodataframe derived from calculate_forest_buffer
+    # )
+    pass
+
+    # arable_buffer = belt_calculate_arable_buffer(
+    #     region='Липецкая область',
+    #     arable_gdf=arable_gdf,
+    #     arable_area_ha_threshold=10,
+    #     arable_buffer_distance=20
+    # )
+
+    belt_calculate_arable_buffer_eliminate(
+        region='Липецкая область',
+        arable_buffer=arable_buffer,
+        meadow_gdf=meadow_gdf,
+        limitation_full=limitation_full
+    )
+
+    pass
     # prepare_road_limitations(
     #     region='Липецкая область'
     # )
