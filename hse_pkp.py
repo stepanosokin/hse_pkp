@@ -16,8 +16,9 @@ from tqdm import tqdm
 import math
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
-from skimage.morphology import skeletonize
 from centerline.geometry import Centerline
+import math
+import networkx as nx
 
 # Сложности https://github.com/astral-sh/uv/issues/11466
 from osgeo import gdal
@@ -27,6 +28,210 @@ from osgeo_utils import gdal_calc
 # import requests
 import yadisk
 import boto3
+
+
+#########################################################################
+####вспомогательные функции для расчета длиннейшего маршрута - начало####
+###########сгенерировано GPT-5 (low reasoning)###########################
+#########################################################################
+def _round_xy(pt, tol):
+    # Quantize coordinates to grid of size tol to glue nearly-identical nodes
+    if tol is None or tol <= 0:
+        return (pt[0], pt[1])
+    return (round(pt[0]/tol)*tol, round(pt[1]/tol)*tol)
+
+
+def graph_from_multiline(multi: shapely.geometry.MultiLineString, tol=0.0, weight_by_length=True):
+    """
+    Build an undirected NetworkX graph from a MultiLineString.
+    Nodes are (x,y) tuples (optionally snapped/rounded with `tol`).
+    Edge weight is geometric length (if weight_by_length).
+    """
+    G = nx.Graph()
+    if multi is None or multi.is_empty:
+        return G
+    lines = multi.geoms if multi.geom_type == "MultiLineString" else [multi]
+    for ls in lines:
+        if ls is None or ls.is_empty: 
+            continue
+        coords = list(ls.coords)
+        # Add edges for each segment between consecutive vertices
+        for i in range(len(coords)-1):
+            a = _round_xy(coords[i], tol)
+            b = _round_xy(coords[i+1], tol)
+            if a == b:
+                continue
+            w = shapely.geometry.LineString([a, b]).length if weight_by_length else 1.0
+            # If multiple parallel edges exist, keep the max weight
+            if G.has_edge(a, b):
+                if w > G[a][b].get("weight", 1.0):
+                    G[a][b]["weight"] = w
+            else:
+                G.add_edge(a, b, weight=w)
+    return G
+
+
+def longest_simple_path_tree(G):
+    """
+    Longest simple path in a tree = diameter.
+    Returns list of nodes in order.
+    """
+    # 1st sweep
+    s = next(iter(G.nodes))
+    dist = nx.single_source_dijkstra_path_length(G, s, weight="weight")
+    a = max(dist, key=dist.get)
+    # 2nd sweep
+    dist2, paths2 = nx.single_source_dijkstra(G, a, weight="weight")
+    b = max(dist2, key=dist2.get)
+    return paths2[b], dist2[b]
+
+
+def longest_path_with_cycles_small(G, cutoff=None):
+    """
+    Exact longest simple path (NP-hard). Feasible only for small graphs.
+    Uses all simple paths up to cutoff. Returns best path and weight.
+    """
+    def path_weight(path):
+        return sum(G[path[i]][path[i+1]].get("weight", 1.0) for i in range(len(path)-1))
+
+    best_p, best_w = None, -math.inf
+    nodes = list(G.nodes)
+    for i, s in enumerate(nodes):
+        for t in nodes[i+1:]:
+            for p in nx.all_simple_paths(G, s, t, cutoff=cutoff):
+                w = path_weight(p)
+                if w > best_w:
+                    best_p, best_w = p, w
+    return best_p, best_w
+
+
+def farthest_shortest_path(G):
+    """
+    Approximate “longest route” as farthest pair by shortest-path distance.
+    Returns path and distance.
+    """
+    best_pair, best_d = None, -math.inf
+    for s, lengths in nx.all_pairs_dijkstra_path_length(G, weight="weight"):
+        for t, d in lengths.items():
+            if d > best_d:
+                best_d, best_pair = d, (s, t)
+    if best_pair is None:
+        return None, 0.0
+    return nx.dijkstra_path(G, *best_pair, weight="weight"), best_d
+
+
+def longest_route_from_multilines(multi, tol=0.0, exact_for_cycles=False, cutoff=200):
+    """
+    Compute a longest route as a LineString from a (Multi)LineString network.
+    - tol: snap tolerance (same units as coordinates).
+    - exact_for_cycles: if True, try exact simple path enumeration (small graphs only).
+    - cutoff: maximum nodes in simple path enumeration.
+    """
+    G = graph_from_multiline(multi, tol=tol, weight_by_length=True)
+    if G.number_of_nodes() == 0:
+        return shapely.geometry.LineString()
+
+    best_ls, best_len = None, -math.inf
+    for nodes in nx.connected_components(G):
+        H = G.subgraph(nodes).copy()
+        if H.number_of_edges() == 0:
+            continue
+        if nx.is_tree(H):
+            p, w = longest_simple_path_tree(H)
+        else:
+            if exact_for_cycles and H.number_of_nodes() <= cutoff:
+                p, w = longest_path_with_cycles_small(H, cutoff=cutoff)
+            else:
+                p, w = farthest_shortest_path(H)
+        if p is None:
+            continue
+        if w > best_len:
+            best_len = w
+            best_ls = shapely.geometry.LineString(p)
+
+    return best_ls if best_ls is not None else shapely.geometry.LineString()
+
+
+
+def remove_hanging_nodes(
+    multi: shapely.geometry.MultiLineString,
+    tol: float = 0.0,
+    min_branch_length: float = 0.0,
+    iterations=20
+):
+    """
+    Remove only short hanging edges from a (Multi)LineString network.
+
+    Steps:
+    - Build an undirected graph using `graph_from_multiline` (optionally snapping with `tol`).
+    - Iteratively remove edges that have at least one hanging endpoint (degree == 1)
+      and whose geometric length <= `min_branch_length`, until none remain.
+    - Remove isolated nodes created by edge removals.
+    - Reconstruct the remaining network as a MultiLineString and return it.
+
+    Note: Components consisting entirely of short hanging edges may be fully removed.
+    """
+    # Build graph from geometry
+    G = graph_from_multiline(multi, tol=tol, weight_by_length=False)
+    # Nothing to do
+    if G.number_of_edges() == 0:
+        return shapely.geometry.MultiLineString([])
+
+    # Iteratively remove short edges that touch a hanging node
+    thr = float(min_branch_length)
+    # while True:
+    #     short_edges = []
+    #     deg = dict(G.degree())
+    #     for u, v in G.edges():
+    #         try:
+    #             seg_len = shapely.geometry.LineString([u, v]).length
+    #         except Exception:
+    #             seg_len = float("inf")
+    #         if (deg.get(u, 0) == 1 or deg.get(v, 0) == 1) and seg_len <= thr:
+    #             short_edges.append((u, v))
+    #     if not short_edges:
+    #         break
+    #     G.remove_edges_from(short_edges)
+    #     # Drop isolated nodes
+    #     isolated = [n for n, d in G.degree() if d == 0]
+    #     if isolated:
+    #         G.remove_nodes_from(isolated)
+    #     if G.number_of_edges() == 0:
+    #         return shapely.geometry.MultiLineString([])
+    for _ in range(iterations):
+        short_edges = []
+        deg = dict(G.degree())
+        for u, v in G.edges():
+            try:
+                seg_len = shapely.geometry.LineString([u, v]).length
+            except Exception:
+                seg_len = float("inf")
+            if (deg.get(u, 0) == 1 or deg.get(v, 0) == 1) and seg_len <= thr:
+                short_edges.append((u, v))
+        if short_edges:
+            G.remove_edges_from(short_edges)
+        # Drop isolated nodes
+        isolated = [n for n, d in G.degree() if d == 0]
+        if isolated:
+            G.remove_nodes_from(isolated)
+        if G.number_of_edges() == 0:
+            return shapely.geometry.MultiLineString([])
+
+    # Reconstruct geometry from remaining edges
+    segs = []
+    for u, v in G.edges():
+        try:
+            segs.append(shapely.geometry.LineString([u, v]))
+        except Exception:
+            continue
+    if not segs:
+        return shapely.geometry.MultiLineString([])
+    return shapely.geometry.MultiLineString(segs)
+
+
+#########################################################################
+####вспомогательные функции для расчета длиннейшего маршрута - конец#####
+#########################################################################
 
 
 def drop_small_holes(poly, min_hole_area):
@@ -1419,148 +1624,13 @@ def belt_calculate_arable_buffer_eliminate(
     return arable_buffer_eliminate
 
 
-def belt_calculate_skeletons(
-    region='Липецкая область',
-    polygons_gdf=None,
-    pixel_size_m=1.0,
-    min_branch_length_m=0.1
-):
-    # Raster-skeletonize polygons and return centerlines as a GeoDataFrame.
-    # Steps:
-    # 1) Project to local metric CRS (LAEA centered on bbox)
-    # 2) Rasterize polygons at fixed pixel size
-    # 3) Skeletonize raster (thinning)
-    # 4) Convert skeleton pixels to line segments (4-neighborhood), merge, prune
-    # 5) Save to GeoPackage and return
-
-    if polygons_gdf is None or polygons_gdf.empty:
-        return gpd.GeoDataFrame(geometry=[], crs=4326)
-
-    region_shortname = get_region_shortname(region)
-    if region_shortname is None:
-        region_shortname = "region"
-
-    # Choose local metric CRS (LAEA) centered at polygon extent
-    minx, miny, maxx, maxy = polygons_gdf.total_bounds
-    distance_crs = crs.CRS.from_proj4(
-        f"+proj=laea +lat_0={(miny + maxy) / 2} +lon_0={(minx + maxx) / 2} "
-        f"+x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"
-    )
-
-    # Parameters
-    pixel_size_m = pixel_size_m  # meters per pixel
-    min_branch_length_m = min_branch_length_m  # prune very short segments
-
-    g_proj = polygons_gdf.to_crs(distance_crs)
-    gxmin, gymin, gxmax, gymax = g_proj.total_bounds
-    if not np.isfinite([gxmin, gymin, gxmax, gymax]).all():
-        return gpd.GeoDataFrame(geometry=[], crs=4326)
-
-    # Compute raster grid size
-    width = max(1, int(math.ceil((gxmax - gxmin) / pixel_size_m)))
-    height = max(1, int(math.ceil((gymax - gymin) / pixel_size_m)))
-
-    # Build affine transform (origin at top-left)
-    transform = rasterio.transform.from_origin(gxmin, gymax, pixel_size_m, pixel_size_m)
-
-    # Rasterize polygons to a binary mask (1 inside polygon)
-    shapes = [(geom, 1) for geom in g_proj.geometry if geom and not geom.is_empty]
-    if not shapes:
-        return gpd.GeoDataFrame(geometry=[], crs=4326)
-
-    mask = rasterio.features.rasterize(
-        shapes=shapes,
-        out_shape=(height, width),
-        transform=transform,
-        fill=0,
-        all_touched=False,
-        dtype="uint8",
-    )
-
-    # Skeletonize (boolean array where True is foreground)
-    sk = skeletonize(mask.astype(bool))
-
-    # Convert skeleton pixels to line segments by connecting 4-neighbors (right, down)
-    segments = []
-    def pix_center(col, row):
-        x = gxmin + (col + 0.5) * pixel_size_m
-        y = gymax - (row + 0.5) * pixel_size_m
-        return (x, y)
-
-    H, W = sk.shape
-    for r in range(H):
-        row = sk[r]
-        for c in range(W):
-            if not row[c]:
-                continue
-            # right neighbor
-            if c + 1 < W and sk[r, c + 1]:
-                p0 = pix_center(c, r)
-                p1 = pix_center(c + 1, r)
-                segments.append(shapely.geometry.LineString([p0, p1]))
-            # down neighbor
-            if r + 1 < H and sk[r + 1, c]:
-                p0 = pix_center(c, r)
-                p1 = pix_center(c, r + 1)
-                segments.append(shapely.geometry.LineString([p0, p1]))
-
-    if not segments:
-        return gpd.GeoDataFrame(geometry=[], crs=4326)
-
-    # Merge segments into lines
-    seg_series = gpd.GeoSeries(segments, crs=distance_crs)
-    merged = shapely.line_merge(seg_series.unary_union)
-
-    # Normalize to iterable of lines
-    lines = []
-    if merged is None or merged.is_empty:
-        return gpd.GeoDataFrame(geometry=[], crs=4326)
-    if merged.geom_type == "LineString":
-        lines = [merged]
-    elif merged.geom_type == "MultiLineString":
-        lines = list(merged.geoms)
-    else:
-        # Fallback: explode geometries we can iterate
-        try:
-            lines = list(merged.geoms)
-        except Exception:
-            lines = []
-
-    # Prune short branches (by metric length)
-    lines = [ln for ln in lines if ln.length >= min_branch_length_m]
-    if not lines:
-        return gpd.GeoDataFrame(geometry=[], crs=4326)
-
-    skeleton_gdf = gpd.GeoDataFrame(geometry=lines, crs=distance_crs)
-    # Clip to input polygons (to remove rasterization outside effects)
-    try:
-        skeleton_gdf = gpd.overlay(skeleton_gdf, g_proj[[g_proj.geometry.name]], how="intersection")
-    except Exception:
-        # If overlay fails (topology issues), fall back to clip
-        try:
-            skeleton_gdf = gpd.clip(skeleton_gdf, g_proj)
-        except Exception:
-            pass
-
-    # Reproject back to WGS84 for output
-    skeleton_out = skeleton_gdf.to_crs(4326)
-
-    # Save
-    try:
-        out_path = os.path.join("result", f"{region_shortname}_limitations.gpkg")
-        layer_name = f"{region_shortname}_arable_buffer_line"
-        skeleton_out.to_file(out_path, layer=layer_name)
-    except Exception as e:
-        print(f"Warning: failed to save skeletons to GeoPackage: {e}")
-
-    return skeleton_out
-
-
 def belt_calculate_centerlines(
     region='Липецкая область',
     polygons_gdf=None,
-    segmentize_maxlen_m = 1.0,   # densify polygon boundary before centerline
-    min_branch_length_m = 0.1   # prune tiny spurs
+    segmentize_maxlen_m = 0.5,   # densify polygon boundary before centerline
+    min_branch_length_m = 0,   # prune tiny spurs
+    geometry_field='geometry',
+    iterations=1
 ):
     # Compute vector centerlines using the 'centerline' library.
     # 1) Project polygons to a local metric CRS (LAEA centered on bbox)
@@ -1600,24 +1670,38 @@ def belt_calculate_centerlines(
             # Skip non-polygon geometry
             continue
         try:
-            cl = Centerline(geom, segmentize_maxlen=segmentize_maxlen_m)
+            cl = Centerline(
+                geom, 
+                interpolation_distance=segmentize_maxlen_m
+                )
             cl_geom = cl.geometry
         except Exception:
             continue
         if cl_geom is None or cl_geom.is_empty:
             continue
         if cl_geom.geom_type == "LineString":
+            # longest_ls_exact = longest_route_from_multilines(cl_geom, tol=0.01, exact_for_cycles=True, cutoff=200)
             lines.append(cl_geom)
         elif cl_geom.geom_type == "MultiLineString":
-            lines.extend(list(cl_geom.geoms))
+            # lines.extend(list(cl_geom.geoms))
+            # longest_ls_exact = longest_route_from_multilines(cl_geom, tol=0.01, exact_for_cycles=True, cutoff=200)
+            longest_ls_exact = remove_hanging_nodes(
+                cl_geom, 
+                tol=0.01, 
+                min_branch_length=min_branch_length_m,
+                iterations=iterations
+                )
+            if longest_ls_exact:
+                lines.append(longest_ls_exact)
+            else:
+                lines.extend(list(cl_geom.geoms))
 
     if not lines:
         return gpd.GeoDataFrame(geometry=[], crs=4326)
 
     # Build GeoDataFrame in metric CRS
     lines_gdf = gpd.GeoDataFrame(geometry=lines, crs=distance_crs)
-    # Prune short segments
-    lines_gdf = lines_gdf[lines_gdf.length >= min_branch_length_m].copy()
+    
     if lines_gdf.empty:
         return gpd.GeoDataFrame(geometry=[], crs=4326)
 
@@ -1629,19 +1713,71 @@ def belt_calculate_centerlines(
             lines_gdf = gpd.clip(lines_gdf, g_proj)
         except Exception:
             pass
+    
+    # Dissolve all line segments into a single geometry
+    try:
+        lines_gdf = lines_gdf.dissolve()
+        lines_gdf[geometry_field] = lines_gdf[geometry_field].line_merge()
+        lines_gdf = lines_gdf.explode()
+    except Exception:
+        pass
+
+    # # Prune short segments
+    # lines_gdf = lines_gdf[lines_gdf.length >= min_branch_length_m].copy()
 
     # Back to WGS84
-    out_gdf = lines_gdf.to_crs(4326)
+    arable_buffer_line = lines_gdf.to_crs(4326)
 
     # Save result
     try:
         out_path = os.path.join("result", f"{region_shortname}_limitations.gpkg")
-        layer_name = f"{region_shortname}_arable_buffer_line_centerline"
-        out_gdf.to_file(out_path, layer=layer_name)
+        layer_name = f"{region_shortname}_arable_buffer_line"
+        arable_buffer_line.to_file(out_path, layer=layer_name)
     except Exception as e:
         print(f"Warning: failed to save centerlines: {e}")
 
-    return out_gdf
+    belt_line = arable_buffer_line.reset_index(drop=True).copy()
+    belt_line["belt_id"] = belt_line.index + 1
+    belt_line["type"] = '' 
+    belt_line["buf_dist"] = 0
+
+    # Save result
+    try:
+        out_path = os.path.join("result", f"{region_shortname}_limitations.gpkg")
+        layer_name = f"{region_shortname}_belt_line"
+        belt_line.to_file(out_path, layer=layer_name)
+    except Exception as e:
+        print(f"Warning: failed to save centerlines: {e}")
+
+    return arable_buffer_line, belt_line
+
+
+def belt_classify_main_gulch(
+    region='Липецкая область',
+    belt_line=None,
+    arable_gdf=None
+):
+    region_shortname = get_region_shortname(region)
+    if region_shortname is None:
+        region_shortname = "region"
+    belt_buffers_geom = calculate_geod_buffers(
+        i_gdf=belt_line,
+        buffer_crs='laea',                # or 'utm' if you prefer
+        buffer_dist_source='value',
+        buffer_distance=20,
+        geom_field='geometry'
+    )
+    belt_check_buf = belt_line.set_geometry(belt_buffers_geom)
+    #  # Save result
+    # try:
+    #     out_path = os.path.join("result", f"{region_shortname}_limitations.gpkg")
+    #     layer_name = f"{region_shortname}_belt_check_buf"
+    #     belt_check_buf.to_file(out_path, layer=layer_name)
+    # except Exception as e:
+    #     print(f"Warning: failed to save centerlines: {e}")
+    # return belt_check_buf
+
+
 
 
 
@@ -1734,6 +1870,14 @@ def calculate_forest_belt(
         arable_buffer=arable_buffer,
         meadow_gdf=meadow_gdf,
         limitation_full=limitation_full
+    )
+
+    ####################централины######################
+    _, belt_line = belt_calculate_centerlines(
+        region=region,
+        polygons_gdf=arable_buffer_eliminate,
+        segmentize_maxlen_m = 10.0,   # densify polygon boundary before centerline
+        min_branch_length_m = 100.0   # prune tiny spurs
     )
     
 
@@ -2126,23 +2270,11 @@ if __name__ == '__main__':
         'result/Lipetskaya_Limitations.gpkg', 
         layer='Lipetskaya_arable_buffer_eliminate'
         )
-    # calculate_forest_belt(
-    #     region='Липецкая область',
-    #     limitations_all=limitations_all,   # geodataframe derived from prepare_limitations
-    #     lulc_link='lulc/S2LULC_10m_LAEA_48_202507081046_sample.tif',
-    #     postgres_info='.secret/.gdcdb',
-    #     regions_table='admin.hse_russia_regions',
-    #     region_buf_size=5000,
-    #     road_table='osm.gis_osm_roads_free',
-    #     road_buf_size_rule={
-    #         "fclass  in  ('primary', 'primary_link')": 80,
-    #         "fclass in ('motorway' , 'motorway_link')": 80,
-    #         "fclass in ('secondary', 'secondary_link')": 70,
-    #         "fclass in ('tertiary', 'tertiary_link')": 70,
-    #         "fclass in ('trunk', 'trunk_link')": 70,
-    #         "fclass in ('unclassified')": 70,
-    #     }
-    # )
+    belt_line = gpd.read_file(
+        'result/Lipetskaya_Limitations.gpkg', 
+        layer='Lipetskaya_belt_line'
+        )
+    
 
     # limitation_full = belt_merge_limitation_full(
     #     region='Липецкая область',
@@ -2165,21 +2297,39 @@ if __name__ == '__main__':
     #     limitation_full=limitation_full
     # )
 
-    # arable_buffer_line = belt_calculate_skeletons(
+    # _, belt_line = belt_calculate_centerlines(
     #     region='Липецкая область',
     #     polygons_gdf=arable_buffer_eliminate,
-    #     pixel_size_m=1,
-    #     min_branch_length_m=0.1
+    #     segmentize_maxlen_m = 10.0,   # densify polygon boundary before centerline
+    #     min_branch_length_m = 100.0,   # prune tiny spurs
+    #     iterations=1
     # )
 
-    arable_buffer_line = belt_calculate_centerlines(
+    belt_classify_main_gulch(
         region='Липецкая область',
-        polygons_gdf=arable_buffer_eliminate,
-        segmentize_maxlen_m = 1.0,   # densify polygon boundary before centerline
-        min_branch_length_m = 0.1   # prune tiny spurs
+        belt_line=belt_line,
+        arable_gdf=arable_gdf
     )
 
     pass
     # prepare_road_limitations(
     #     region='Липецкая область'
+    # )
+
+    # calculate_forest_belt(
+    #     region='Липецкая область',
+    #     limitations_all=limitations_all,   # geodataframe derived from prepare_limitations
+    #     lulc_link='lulc/S2LULC_10m_LAEA_48_202507081046_sample.tif',
+    #     postgres_info='.secret/.gdcdb',
+    #     regions_table='admin.hse_russia_regions',
+    #     region_buf_size=5000,
+    #     road_table='osm.gis_osm_roads_free',
+    #     road_buf_size_rule={
+    #         "fclass  in  ('primary', 'primary_link')": 80,
+    #         "fclass in ('motorway' , 'motorway_link')": 80,
+    #         "fclass in ('secondary', 'secondary_link')": 70,
+    #         "fclass in ('tertiary', 'tertiary_link')": 70,
+    #         "fclass in ('trunk', 'trunk_link')": 70,
+    #         "fclass in ('unclassified')": 70,
+    #     }
     # )
