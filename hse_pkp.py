@@ -11,6 +11,7 @@ import sqlalchemy
 from zipfile import ZipFile
 import os
 import rasterio
+import rasterio.features
 import numpy as np
 from tqdm import tqdm
 import math
@@ -526,7 +527,7 @@ def prepare_water_limitations(
     regions_table='admin.hse_russia_regions',
     region_buf_size=0,
     # source_water_pol='data/water_pol.shp',
-    # result_gpkg='result/water_limitations.gpkg',
+    result_gpkg='result/water_limitations.gpkg',
     buffer_distance = 5,
     buffer_crs = 'utm',
     geometry_field='geom'
@@ -626,7 +627,7 @@ def prepare_water_limitations(
     gdf_l_buffered = gdf_l_buffered[my_columns]
     # расчет значений размеров буферов
     gdf_l_buffered['buf'] = [50 if x <= 10000 else 100 if 10000 < x <= 50000 else 200 for x in gdf_l_buffered['leng']]
-    gdf_l['buf'] = [50 if x <= 10 else 100 if 10000 < x <= 50000 else 200 for x in gdf_l['leng']]
+    gdf_l['buf'] = [50 if x <= 10000 else 100 if 10000 < x <= 50000 else 200 for x in gdf_l['leng']]
     # gdf_l.to_file(result_gpkg, layer='water_lines_buf')
     water_lines_buf = gdf_l_buffered.copy()
     # вычислить геодезические буферы по полю buf  
@@ -647,7 +648,7 @@ def prepare_water_limitations(
     # Сделать пространственное присоединение обработанных линейных объектов по пересечению
     gdf_l = gdf_l.clip(gdf_p)
     gdf_l['leng'] = [geod.geometry_length(row[geometry_field]) for i, row in gdf_l.iterrows()]
-    # gdf_l.to_file(result_gpkg, layer='water_lines_clipped')
+    gdf_l.to_file(result_gpkg, layer='water_lines_clipped') #
     gdf_p = gdf_p.sjoin(gdf_l, how='left')
     # Отсортировать результат по длине присоединенного объекта по убыванию
     gdf_p = gdf_p.sort_values(by='leng', ascending=False)
@@ -665,7 +666,7 @@ def prepare_water_limitations(
     
     # Там где не присоединилась длина линейного объекта и площадь больше 0.5, вставить buf=50
     gdf_p['buf'] = [50 if all([x >= 0.5, y]) else z for x, y, z in zip(gdf_p['area_km'], gdf_p['leng'].isna(), gdf_p['buf'])]
-    # gdf_p.to_file(result_gpkg, layer='water_poly_leng')
+    gdf_p.to_file(result_gpkg, layer='water_poly_leng') #
     # убрать объекты с пустыми значениями buf
     gdf_p = gdf_p[gdf_p['buf'].notnull()]
     # вычислить геодезические буферы по полю buf  
@@ -1404,6 +1405,22 @@ def belt_merge_limitation_full(
             # Add source column to keep provenance
             gdf = gdf.copy()
             gdf["src"] = name
+            # Ensure geometry column is named 'geometry' and set as active geometry
+            try:
+                active_geom_col = getattr(gdf.geometry, 'name', None)
+            except Exception:
+                active_geom_col = None
+            # If active geometry column exists and isn't named 'geometry', rename it
+            if active_geom_col and active_geom_col != 'geometry':
+                # If there is already a 'geometry' column, drop it to avoid conflict
+                if 'geometry' in gdf.columns and active_geom_col in gdf.columns:
+                    gdf = gdf.drop(columns=['geometry'])
+                gdf = gdf.rename(columns={active_geom_col: 'geometry'}).set_geometry('geometry')
+                pass
+            else:
+                # If a 'geometry' column exists but isn't active, set it as active geometry
+                if 'geometry' in gdf.columns and getattr(gdf.geometry, 'name', None) != 'geometry':
+                    gdf = gdf.set_geometry('geometry')
             parts.append(gdf)
         if parts:
             # Unify columns
@@ -1768,14 +1785,14 @@ def belt_classify_main_gulch(
         geom_field='geometry'
     )
     belt_check_buf = belt_line.set_geometry(belt_buffers_geom)
-    #  # Save result
-    # try:
-    #     out_path = os.path.join("result", f"{region_shortname}_limitations.gpkg")
-    #     layer_name = f"{region_shortname}_belt_check_buf"
-    #     belt_check_buf.to_file(out_path, layer=layer_name)
-    # except Exception as e:
-    #     print(f"Warning: failed to save centerlines: {e}")
-    # return belt_check_buf
+     # Save result
+    try:
+        out_path = os.path.join("result", f"{region_shortname}_limitations.gpkg")
+        layer_name = f"{region_shortname}_belt_check_buf"
+        belt_check_buf.to_file(out_path, layer=layer_name)
+    except Exception as e:
+        print(f"Warning: failed to save centerlines: {e}")
+    return belt_check_buf
 
 
 
@@ -2107,6 +2124,23 @@ def prepare_limitations(
         # Add source column to keep provenance
         gdf = gdf.copy()
         gdf["src"] = name
+        # Ensure geometry column is named 'geom' and set as active geometry
+        try:
+            active_geom_col = getattr(gdf.geometry, 'name', None)
+        except Exception:
+            active_geom_col = None
+        # If active geometry column exists and isn't named 'geom', rename it
+        if active_geom_col and active_geom_col != 'geom':
+            # If there is already a 'geom' column, drop it to avoid conflict
+            if 'geom' in gdf.columns and active_geom_col in gdf.columns:
+                gdf = gdf.drop(columns=['geom'])
+            gdf = gdf.rename(columns={active_geom_col: 'geom'}).set_geometry('geom')
+            pass
+        else:
+            # If a 'geom' column exists but isn't active, set it as active geometry
+            if 'geom' in gdf.columns and getattr(gdf.geometry, 'name', None) != 'geom':
+                gdf = gdf.set_geometry('geom')
+
         parts.append(gdf)
     if parts:
         # Unify columns
@@ -2177,22 +2211,25 @@ def prepare_limitations(
 
     
 if __name__ == '__main__':
+
+    current_dir = os.getcwd()
+
     # prepare_water_limitations(
     #     region='Липецкая область',
-    #     source_water_line='data/Lipetsk_water_lines_3857/Lipetsk_water_lines_3857.shp',
-    #     source_water_pol='data/Lipetsk_water_poly_3857/Lipetsk_water_poly_3857.shp',
     #     result_gpkg='result/water_limitations.gpkg',
     #     buffer_distance = 5,
     #     buffer_crs = 'utm'
     #     )
+    # pass
     
-    # prepare_slope_limitations(
+    # slope_more_12 = prepare_slope_limitations(
     #     region='Липецкая область',
     #     slope_threshold=12,
     #     fabdem_zip_path=r"\\172.21.204.20\geodata\_PROJECTS\pkp\vm0047_prod\dem_fabdem",
     #     rescale=True,
     #     rescale_size=10
     # )
+    # pass
 
     # prepare_wetlands_limitations(
     #     region='Липецкая область',
@@ -2237,7 +2274,14 @@ if __name__ == '__main__':
     #     oopt_table='ecology.pkp_oopt_russia_2024',
     #     forest_table='forest.pkp_forest_glf'
     # )
+    # pass
 
+    
+
+    forest_gdf = gpd.read_file(
+        'result/Lipetskaya_lulc.gpkg', 
+        layer='Lipetskaya_lulc_forest'
+        )
     limitations_all = gpd.read_file(
         'result/Lipetskaya_limitations.gpkg', 
         layer='Lipetskaya_all_limitations'
@@ -2274,7 +2318,48 @@ if __name__ == '__main__':
         'result/Lipetskaya_Limitations.gpkg', 
         layer='Lipetskaya_belt_line'
         )
+
+
+    region_shortname = get_region_shortname('Липецкая область')
+    if region_shortname is None:
+        region_shortname = "region"
+
+    # lulc_gdfs = belt_vectorize_lulc(
+    #         region='Липецкая область',
+    #         lulc_link='lulc/S2LULC_10m_LAEA_48_202507081046_sample.tif'
+    #         )
+    # water_gdf = lulc_gdfs.get('water_gdf')
+    # forest_gdf = lulc_gdfs.get('forest_gdf')
+    # meadow_gdf = lulc_gdfs.get('meadow_gdf')
+    # arable_gdf = lulc_gdfs.get('arable_gdf')
+    # build_gdf = lulc_gdfs.get('build_gdf')
+    # for name, lulc_gdf in lulc_gdfs.items():
+    #     lulc_gdf.to_file(
+    #         os.path.join(current_dir, 'result', f'{region_shortname}_lulc.gpkg'), 
+    #         layer=f"{region_shortname}_lulc_{name.replace('_gdf', '')}"
+    #         )
     
+    # forest_50m = belt_calculate_forest_buffer(
+    #     region='Липецкая область',
+    #     forest_gdf=forest_gdf
+    #     )
+
+    # road_OSM_cover_buf = prepare_road_limitations(
+    #     postgres_info='.secret/.gdcdb',
+    #     region='Липецкая область', 
+    #     regions_table='admin.hse_russia_regions',
+    #     region_buf_size=5000,
+    #     road_table='osm.gis_osm_roads_free',
+    #     road_buf_size_rule={
+    #         "fclass  in  ('primary', 'primary_link')": 80,
+    #         "fclass in ('motorway' , 'motorway_link')": 80,
+    #         "fclass in ('secondary', 'secondary_link')": 70,
+    #         "fclass in ('tertiary', 'tertiary_link')": 70,
+    #         "fclass in ('trunk', 'trunk_link')": 70,
+    #         "fclass in ('unclassified')": 70,
+    #     },
+    #     road_buffer_crs='utm',
+    # )
 
     # limitation_full = belt_merge_limitation_full(
     #     region='Липецкая область',
@@ -2282,6 +2367,7 @@ if __name__ == '__main__':
     #     road_OSM_cover_buf=road_OSM_cover_buf,   # geodataframe derived from calculate_road_buffer
     #     forest_50m=forest_50m   # geodataframe derived from calculate_forest_buffer
     # )
+    # pass
 
     # arable_buffer = belt_calculate_arable_buffer(
     #     region='Липецкая область',
@@ -2289,6 +2375,7 @@ if __name__ == '__main__':
     #     arable_area_ha_threshold=10,
     #     arable_buffer_distance=20
     # )
+    # pass
 
     # arable_buffer_eliminate = belt_calculate_arable_buffer_eliminate(
     #     region='Липецкая область',
@@ -2296,6 +2383,7 @@ if __name__ == '__main__':
     #     meadow_gdf=meadow_gdf,
     #     limitation_full=limitation_full
     # )
+    # pass
 
     # _, belt_line = belt_calculate_centerlines(
     #     region='Липецкая область',
@@ -2304,6 +2392,7 @@ if __name__ == '__main__':
     #     min_branch_length_m = 100.0,   # prune tiny spurs
     #     iterations=1
     # )
+    # pass
 
     belt_classify_main_gulch(
         region='Липецкая область',
