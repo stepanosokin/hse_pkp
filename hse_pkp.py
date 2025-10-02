@@ -1754,7 +1754,8 @@ def belt_calculate_centerlines(
         print(f"Warning: failed to save centerlines: {e}")
 
     belt_line = arable_buffer_line.reset_index(drop=True).copy()
-    belt_line["belt_id"] = belt_line.index + 1
+    # belt_line["belt_id"] = belt_line.index + 1
+    belt_line["belt_id"] = np.arange(1, len(belt_line) + 1, dtype=int)
     belt_line["type"] = '' 
     belt_line["buf_dist"] = 0
 
@@ -1774,9 +1775,11 @@ def belt_classify_main_gulch(
     belt_line=None,
     arable_gdf=None
 ):
+    # получить короткое название региона
     region_shortname = get_region_shortname(region)
     if region_shortname is None:
         region_shortname = "region"
+    # вычислить буферы вокруг линий
     belt_buffers_geom = calculate_geod_buffers(
         i_gdf=belt_line,
         buffer_crs='laea',                # or 'utm' if you prefer
@@ -1785,19 +1788,86 @@ def belt_classify_main_gulch(
         geom_field='geometry'
     )
     belt_check_buf = belt_line.set_geometry(belt_buffers_geom)
-     # Save result
+    
+    # Convert polygons to line geometries (boundaries)
+    belt_check_buf_clipped = belt_check_buf.set_geometry(belt_check_buf.geometry.boundary)
+    belt_check_buf_clipped = gpd.clip(belt_check_buf_clipped, arable_gdf)
+    
+    geod = Geod(ellps='WGS84')
+    belt_check_buf_clipped['length_border_arable'] = [geod.geometry_length(row[belt_check_buf_clipped.geometry.name]) for i, row in belt_check_buf_clipped.iterrows()]
+    # belt_check_buf_clipped.to_file(
+    #     f'result/{region_shortname}_limitations.gpkg', 
+    #     layer='tmp_belt_check_buf_clipped'
+    #     )
+    # Join aggregated arable-border lengths back to belts by belt_id
+    belt_check_buf['length_border_arable'] = belt_check_buf['belt_id'].map(belt_check_buf_clipped.groupby('belt_id')['length_border_arable'].sum()).fillna(0)
+    # calculate full border length (perimeter)
+    belt_check_buf['length_border_full'] = [geod.geometry_area_perimeter(g)[1] for g in belt_check_buf.geometry]
+    # calculate border ratio
+    belt_check_buf['border_ratio'] = belt_check_buf['length_border_arable'] / belt_check_buf['length_border_full']
+    # classify type by percentage of arable border (>60% => 'основные', else 'прибалочные')
+    belt_check_buf['type'] = np.where(belt_check_buf['border_ratio'] > 0.6, 'основные', 'прибалочные')
+    
+    belt_line['type'] = belt_line['belt_id'].map(belt_check_buf.groupby('belt_id')['type'].first()).fillna(0)
+    belt_line['border_ratio'] = belt_line['belt_id'].map(belt_check_buf.groupby('belt_id')['border_ratio'].first()).fillna(0)
+    belt_line['length_border_full'] = belt_line['belt_id'].map(belt_check_buf.groupby('belt_id')['length_border_full'].first()).fillna(0)
+    belt_line['length_border_arable'] = belt_line['belt_id'].map(belt_check_buf.groupby('belt_id')['length_border_arable'].first()).fillna(0)
+
+    # belt_check_buf.to_file(
+    #     f'result/{region_shortname}_limitations.gpkg', 
+    #     layer='tmp_belt_check_buf_arable'
+    #     )
+
+    # buffer distance by type: 'основные' -> 5, 'прибалочные' -> 10
+    belt_line['buf_dist'] = np.where(
+        belt_line['type'] == 'основные', 
+        5, 
+        np.where(belt_line['type'] == 'прибалочные', 10, 0)
+    )
+    # belt_line['buf_dist'] = np.where(belt_line['type'] == 'прибалочные', 10)
+    
+    # Calculate geodesic buffers per belt using 'buf_dist' and set to belt_line geometry
+    belt_buffers_geom2 = calculate_geod_buffers(
+        i_gdf=belt_line,
+        buffer_crs='laea',
+        buffer_dist_source='field',
+        buffer_distance='buf_dist',
+        geom_field=belt_line.geometry.name
+    )
+    belt_line = belt_line.set_geometry(belt_buffers_geom2)
+
+    # Save main belts (type == 'основные') as a separate layer
+    main_belt = belt_line[belt_line['type'] == 'основные'].copy()
+    main_belt = main_belt.dissolve().explode()
+    # Save gully belts (type == 'прибалочные') as a separate layer
+    gully_belt = belt_line[belt_line['type'] == 'прибалочные'].copy()
+    gully_belt = gully_belt.dissolve().explode()
+    # Remove fields not needed in main_belt
+    cols = ['border_ratio', 'length_border_full', 'length_border_arable']
+    main_belt = main_belt.drop(columns=cols)
+    gully_belt = gully_belt.drop(columns=cols)
+    try:
+        out_path = os.path.join("result", f"{region_shortname}_limitations.gpkg")
+        layer_name = f"{region_shortname}_main_belt"
+        main_belt.to_file(out_path, layer=layer_name)
+    except Exception as e:
+        print(f"Warning: failed to save main_belt: {e}")
+    try:
+        out_path = os.path.join("result", f"{region_shortname}_limitations.gpkg")
+        layer_name = f"{region_shortname}_gully_belt"
+        gully_belt.to_file(out_path, layer=layer_name)
+    except Exception as e:
+        print(f"Warning: failed to save gully_belt: {e}")
     try:
         out_path = os.path.join("result", f"{region_shortname}_limitations.gpkg")
         layer_name = f"{region_shortname}_belt_check_buf"
         belt_check_buf.to_file(out_path, layer=layer_name)
     except Exception as e:
-        print(f"Warning: failed to save centerlines: {e}")
-    return belt_check_buf
+        print(f"Warning: failed to save belt_check_buf: {e}")
 
-
-
-
-
+    return (main_belt, gully_belt)
+    
+    
 def calculate_forest_belt(
     region='Липецкая область',
     limitations_all=None,   # geodataframe derived from prepare_limitations
@@ -1895,6 +1965,13 @@ def calculate_forest_belt(
         polygons_gdf=arable_buffer_eliminate,
         segmentize_maxlen_m = 10.0,   # densify polygon boundary before centerline
         min_branch_length_m = 100.0   # prune tiny spurs
+    )
+
+    ####РАЗДЕЛЕНИЕ ЛЕСОПОЛОС НА ПРИБАЛОЧНЫЕ И ПОЛЕЗАЩИТНЫЕ###
+    main_belt, gully_belt = belt_classify_main_gulch(
+        region='Липецкая область',
+        belt_line=belt_line,
+        arable_gdf=arable_gdf
     )
     
 
@@ -2319,6 +2396,15 @@ if __name__ == '__main__':
         layer='Lipetskaya_belt_line'
         )
 
+    main_belt = gpd.read_file(
+        'result/Lipetskaya_Limitations.gpkg', 
+        layer='Lipetskaya_main_belt'
+        )
+    gully_belt = gpd.read_file(
+        'result/Lipetskaya_Limitations.gpkg', 
+        layer='Lipetskaya_gully_belt'
+        )
+
 
     region_shortname = get_region_shortname('Липецкая область')
     if region_shortname is None:
@@ -2394,11 +2480,11 @@ if __name__ == '__main__':
     # )
     # pass
 
-    belt_classify_main_gulch(
-        region='Липецкая область',
-        belt_line=belt_line,
-        arable_gdf=arable_gdf
-    )
+    # belt_classify_main_gulch(
+    #     region='Липецкая область',
+    #     belt_line=belt_line,
+    #     arable_gdf=arable_gdf
+    # )
 
     pass
     # prepare_road_limitations(
