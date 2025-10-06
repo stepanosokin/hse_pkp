@@ -17,6 +17,7 @@ from tqdm import tqdm
 import math
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
+from scipy.ndimage import gaussian_filter1d
 from centerline.geometry import Centerline
 import math
 import networkx as nx
@@ -29,6 +30,61 @@ from osgeo_utils import gdal_calc
 # import requests
 import yadisk
 import boto3
+
+
+def gaussian_smooth_polygon(geom, sigma=2):
+    if geom.geom_type == 'Polygon':
+        coords = np.array(geom.exterior.coords)
+        # Smooth x and y separately
+        x_smooth = gaussian_filter1d(coords[:, 0], sigma=sigma, mode='wrap')
+        y_smooth = gaussian_filter1d(coords[:, 1], sigma=sigma, mode='wrap')
+        smoothed_coords = np.column_stack([x_smooth, y_smooth])
+        return shapely.geometry.Polygon(smoothed_coords)
+    elif geom.geom_type == 'MultiPolygon':
+        smoothed_parts = [
+            gaussian_smooth_polygon(poly, sigma) 
+            for poly in geom.geoms
+        ]
+        return shapely.geometry.MultiPolygon(smoothed_parts)
+    return geom
+
+
+def chaikin_smooth(geom, iterations=5):
+    if geom.geom_type == 'Polygon':
+        exterior = list(geom.exterior.coords)
+        for _ in range(iterations):
+            smoothed = []
+            for i in range(len(exterior) - 1):
+                p1, p2 = exterior[i], exterior[i + 1]
+                q = (0.75 * p1[0] + 0.25 * p2[0], 0.75 * p1[1] + 0.25 * p2[1])
+                r = (0.25 * p1[0] + 0.75 * p2[0], 0.25 * p1[1] + 0.75 * p2[1])
+                smoothed.extend([q, r])
+            exterior = smoothed + [smoothed[0]]
+        return shapely.geometry.Polygon(exterior)
+    elif geom.geom_type == 'MultiPolygon':
+        smoothed_parts = [
+            chaikin_smooth(poly, iterations) 
+            for poly in geom.geoms
+        ]
+        return shapely.geometry.MultiPolygon(smoothed_parts)
+    elif geom.geom_type == 'LineString':
+        coords = list(geom.coords)
+        for _ in range(iterations):
+            smoothed = []
+            for i in range(len(coords) - 1):
+                p1, p2 = coords[i], coords[i + 1]
+                q = (0.75 * p1[0] + 0.25 * p2[0], 0.75 * p1[1] + 0.25 * p2[1])
+                r = (0.25 * p1[0] + 0.75 * p2[0], 0.25 * p1[1] + 0.75 * p2[1])
+                smoothed.extend([q, r])
+            coords = smoothed
+        return shapely.geometry.LineString(coords)
+    elif geom.geom_type == 'MultiLineString':
+        smoothed_parts = [
+            chaikin_smooth(line, iterations) 
+            for line in geom.geoms
+        ]
+        return shapely.geometry.MultiLineString(smoothed_parts)
+    return geom
 
 
 #########################################################################
@@ -1604,12 +1660,30 @@ def belt_calculate_arable_buffer_eliminate(
         layer=f"{region_shortname}_arable_buffer_aggregate"
     )
 
-    # PAEK-like smoothing: project to metric CRS, buffer-debuffer, project back
+    # smoothing with different options 
     if not arable_buffer_aggregate.empty:
-        smooth_tolerance = 5  # meters
+        smooth_tolerance = 10  # meters
         g_proj = arable_buffer_aggregate.to_crs(distance_crs)
         
-        g_proj["geometry"] = g_proj.buffer(smooth_tolerance).buffer(-smooth_tolerance)
+        
+
+        # option a: PAEK-like smoothing: project to metric CRS, buffer-debuffer, project back (buffer-debuffer)
+        # for t in range(1, smooth_tolerance + 1):
+        # for t in range(10, 0, -1):
+        #     g_proj["geometry"] = g_proj.buffer(t).buffer(-t)
+        # for t in range(10, 0, -1):
+        #     g_proj["geometry"] = g_proj.buffer(t/10).buffer(-t/10)
+        # g_proj["geometry"] = g_proj.buffer(smooth_tolerance).buffer(-smooth_tolerance)
+
+        # # option c: shapely.geometry.simplify
+        g_proj["geometry"] = g_proj["geometry"].simplify(tolerance=0.1, preserve_topology=True)
+
+        # # option b: Chaikin's (from Claude Sonnet 4.5)
+        # g_proj["geometry"] = g_proj.apply(lambda row: chaikin_smooth(row["geometry"], iterations=10), axis=1)
+        
+        # option d: gaussian smooth (from Claude Sonnet 4.5)
+        g_proj["geometry"] = g_proj["geometry"].apply(lambda geom: gaussian_smooth_polygon(geom, sigma=1))
+        
         arable_buffer_smooth = g_proj.to_crs(4326)
 
         # Recompute area after smoothing
@@ -1963,7 +2037,7 @@ def calculate_forest_belt(
     _, belt_line = belt_calculate_centerlines(
         region=region,
         polygons_gdf=arable_buffer_eliminate,
-        segmentize_maxlen_m = 10.0,   # densify polygon boundary before centerline
+        segmentize_maxlen_m = 5.0,   # densify polygon boundary before centerline
         min_branch_length_m = 100.0   # prune tiny spurs
     )
 
@@ -2391,19 +2465,19 @@ if __name__ == '__main__':
         'result/Lipetskaya_Limitations.gpkg', 
         layer='Lipetskaya_arable_buffer_eliminate'
         )
-    belt_line = gpd.read_file(
-        'result/Lipetskaya_Limitations.gpkg', 
-        layer='Lipetskaya_belt_line'
-        )
+    # belt_line = gpd.read_file(
+    #     'result/Lipetskaya_Limitations.gpkg', 
+    #     layer='Lipetskaya_belt_line'
+    #     )
 
-    main_belt = gpd.read_file(
-        'result/Lipetskaya_Limitations.gpkg', 
-        layer='Lipetskaya_main_belt'
-        )
-    gully_belt = gpd.read_file(
-        'result/Lipetskaya_Limitations.gpkg', 
-        layer='Lipetskaya_gully_belt'
-        )
+    # main_belt = gpd.read_file(
+    #     'result/Lipetskaya_Limitations.gpkg', 
+    #     layer='Lipetskaya_main_belt'
+    #     )
+    # gully_belt = gpd.read_file(
+    #     'result/Lipetskaya_Limitations.gpkg', 
+    #     layer='Lipetskaya_gully_belt'
+    #     )
 
 
     region_shortname = get_region_shortname('Липецкая область')
@@ -2471,20 +2545,20 @@ if __name__ == '__main__':
     # )
     # pass
 
-    # _, belt_line = belt_calculate_centerlines(
-    #     region='Липецкая область',
-    #     polygons_gdf=arable_buffer_eliminate,
-    #     segmentize_maxlen_m = 10.0,   # densify polygon boundary before centerline
-    #     min_branch_length_m = 100.0,   # prune tiny spurs
-    #     iterations=1
-    # )
-    # pass
+    _, belt_line = belt_calculate_centerlines(
+        region='Липецкая область',
+        polygons_gdf=arable_buffer_eliminate,
+        segmentize_maxlen_m = 5.0,   # densify polygon boundary before centerline
+        min_branch_length_m = 100.0,   # prune tiny spurs
+        iterations=1
+    )
+    pass
 
-    # belt_classify_main_gulch(
-    #     region='Липецкая область',
-    #     belt_line=belt_line,
-    #     arable_gdf=arable_gdf
-    # )
+    belt_classify_main_gulch(
+        region='Липецкая область',
+        belt_line=belt_line,
+        arable_gdf=arable_gdf
+    )
 
     pass
     # prepare_road_limitations(
