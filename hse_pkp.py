@@ -30,6 +30,41 @@ from osgeo_utils import gdal_calc
 # import requests
 import yadisk
 import boto3
+from scipy.ndimage import uniform_filter
+
+
+def calculate_tpi_custom_window(input_file, output_file, window_size=5):
+    """
+    Calculate TPI with custom window size
+    
+    Args:
+        input_file: Input DEM raster
+        output_file: Output TPI raster
+        window_size: Window size in pixels (e.g., 5 = 5x5 window)
+    """
+    with rasterio.open(input_file) as src:
+        dem = src.read(1, masked=True)
+        profile = src.profile.copy()
+        
+        # Calculate mean elevation in neighborhood
+        mean_elevation = uniform_filter(
+            dem.filled(np.nan),
+            size=window_size,
+            mode='constant',
+            cval=np.nan
+        )
+        
+        # TPI = elevation - mean of neighbors
+        tpi = dem - mean_elevation
+        
+        # Handle nodata
+        nodata = profile.get('nodata', -9999)
+        tpi_filled = np.where(np.isnan(tpi), nodata, tpi)
+        
+        # Write output
+        profile.update(compress='lzw', tiled=True)
+        with rasterio.open(output_file, 'w', **profile) as dst:
+            dst.write(tpi_filled.astype(profile['dtype']), 1)
 
 
 def gaussian_smooth_polygon(geom, sigma=2):
@@ -418,9 +453,6 @@ def download_from_y_obj_storage(
     except Exception as e:
         raise RuntimeError(f"Failed to download {key} from {bucket}: {e}")
         pass
-
-
-
 
 
 def get_region_shortname(region):
@@ -1616,6 +1648,8 @@ def belt_calculate_arable_buffer_eliminate(
         f"+proj=laea +lat_0={(miny + maxy) / 2} +lon_0={(minx + maxx) / 2} " \
         f"+x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"
     )
+    # wkt=distance_crs.to_wkt()
+    # p=distance_crs.to_proj4()
     arable_buffer_aggregate = arable_buffer_lim.to_crs(distance_crs)
     
     arable_buffer_aggregate = arable_buffer_aggregate.reset_index(drop=True)
@@ -1940,7 +1974,98 @@ def belt_classify_main_gulch(
         print(f"Warning: failed to save belt_check_buf: {e}")
 
     return (main_belt, gully_belt)
-    
+
+
+def belt_calculate_forestation(
+    region='Липецкая область',
+    main_belt=None,
+    gully_belt=None,
+    postgres_info='.secret/.gdcdb',
+    regions_table='admin.hse_russia_regions', 
+    region_buf_size=5000,
+    fabdem_tiles_table='elevation.fabdem_v1_2_tiles',
+    fabdem_zip_path=r"\\172.21.204.20\geodata\_PROJECTS\pkp\vm0047_prod\dem_fabdem",
+    tpi_threshold=2
+):
+    pass
+    # Загрузка параметров подключения к PostgreSQL из JSON-файла
+    try:   
+        with open(postgres_info, encoding='utf-8') as f:
+            pg = json.load(f)
+    except:
+        raise
+    # Создание подключения к базе данных PostgreSQL с SSL
+    try:
+        engine = sqlalchemy.create_engine(
+            f"postgresql+psycopg2://{pg['user']}:{pg['password']}@{pg['host']}:{pg['port']}/{pg['database']}",
+            connect_args={
+                "sslmode": "verify-full",
+                "target_session_attrs": "read-write"
+            },
+        )
+        pass
+    except:
+        raise
+    # Загрузка геометрии региона и тайлов FABDEM из базы данных
+    try:
+        # Получение геометрии региона из таблицы регионов
+        sql = f"select * from {regions_table} where lower(region) = '{region.lower()}';"
+        region_gdf = gpd.read_postgis(sql, engine)
+        # Создание буфера вокруг региона, если указан размер буфера
+        if region_buf_size > 0:
+            region_buffer = calculate_geod_buffers(region_gdf, 'laea', 'value', region_buf_size, geom_field='geom')
+            region_gdf = region_gdf.set_geometry(region_buffer)
+        # Получение тайлов FABDEM, пересекающихся с регионом
+        sql = f"select * from {fabdem_tiles_table} fbdm where ST_Intersects((select geom from {regions_table} where lower(region) = '{region.lower()}' limit 1), fbdm.geom);"
+        tiles_gdf = gpd.read_postgis(sql, engine)
+    except:
+        raise
+
+    current_dir = os.getcwd()
+    os.environ["PROJ_LIB"] = os.path.join(current_dir, '.venv', 'Lib', 'site-packages', 'osgeo', 'data', 'proj')
+    fabdemdir = os.path.join(current_dir, 'fabdem')
+    if not os.path.isdir(fabdemdir):
+        os.mkdir(fabdemdir)
+    final_gdf = None
+
+    for i, row in tqdm(tiles_gdf.iterrows(), desc='tiles loop', total=tiles_gdf.shape[0]):
+        pass
+        # extract current Fabdem tile
+        zipfilename = row['zipfile_name']
+        filename = row['file_name'].replace("N0", "N")
+        zippath = os.path.join(fabdem_zip_path, zipfilename)
+        try:
+            with ZipFile(zippath, 'r') as zObject:
+                zObject.extract(filename, path=fabdemdir)
+            # print(f"Successfully extracted '{file_to_extract}' to '{destination_directory}'")
+        except:
+            raise
+        input_file = os.path.join(fabdemdir, filename)
+        input_dem = gdal.Open(input_file)
+        ##################по Fabdem рассчитать индекс TPI#################
+        output_tpi = os.path.join(fabdemdir, filename.replace('.tif', '_tpi.tif'))
+        if input_dem is None:
+            print(f"Error: Could not open {os.path.join(fabdemdir, filename)}")
+        else:
+            # GDAL's TPI uses a 3x3 window (8 neighbors) by default and this cannot be changed through parameters
+            gdal.DEMProcessing(
+                output_tpi, input_dem, "TPI", 
+                computeEdges=True, 
+                format="GTiff",
+                creationOptions=["COMPRESS=LZW", "TILED=YES"]
+                )
+            pass
+
+        
+        # удалить текущие растры
+        for fl in [ 
+            input_file
+        ]:
+            try:
+                os.remove(fl)
+            except Exception as err:
+                print(err)
+
     
 def calculate_forest_belt(
     region='Липецкая область',
@@ -2043,10 +2168,12 @@ def calculate_forest_belt(
 
     ####РАЗДЕЛЕНИЕ ЛЕСОПОЛОС НА ПРИБАЛОЧНЫЕ И ПОЛЕЗАЩИТНЫЕ###
     main_belt, gully_belt = belt_classify_main_gulch(
-        region='Липецкая область',
+        region=region,
         belt_line=belt_line,
         arable_gdf=arable_gdf
     )
+
+    return main_belt, gully_belt
     
 
 def prepare_road_limitations(
@@ -2465,19 +2592,19 @@ if __name__ == '__main__':
         'result/Lipetskaya_Limitations.gpkg', 
         layer='Lipetskaya_arable_buffer_eliminate'
         )
-    # belt_line = gpd.read_file(
-    #     'result/Lipetskaya_Limitations.gpkg', 
-    #     layer='Lipetskaya_belt_line'
-    #     )
+    belt_line = gpd.read_file(
+        'result/Lipetskaya_Limitations.gpkg', 
+        layer='Lipetskaya_belt_line'
+        )
 
-    # main_belt = gpd.read_file(
-    #     'result/Lipetskaya_Limitations.gpkg', 
-    #     layer='Lipetskaya_main_belt'
-    #     )
-    # gully_belt = gpd.read_file(
-    #     'result/Lipetskaya_Limitations.gpkg', 
-    #     layer='Lipetskaya_gully_belt'
-    #     )
+    main_belt = gpd.read_file(
+        'result/Lipetskaya_Limitations.gpkg', 
+        layer='Lipetskaya_main_belt'
+        )
+    gully_belt = gpd.read_file(
+        'result/Lipetskaya_Limitations.gpkg', 
+        layer='Lipetskaya_gully_belt'
+        )
 
 
     region_shortname = get_region_shortname('Липецкая область')
@@ -2537,27 +2664,38 @@ if __name__ == '__main__':
     # )
     # pass
 
-    # arable_buffer_eliminate = belt_calculate_arable_buffer_eliminate(
-    #     region='Липецкая область',
-    #     arable_buffer=arable_buffer,
-    #     meadow_gdf=meadow_gdf,
-    #     limitation_full=limitation_full
-    # )
-    # pass
-
-    _, belt_line = belt_calculate_centerlines(
+    arable_buffer_eliminate = belt_calculate_arable_buffer_eliminate(
         region='Липецкая область',
-        polygons_gdf=arable_buffer_eliminate,
-        segmentize_maxlen_m = 5.0,   # densify polygon boundary before centerline
-        min_branch_length_m = 100.0,   # prune tiny spurs
-        iterations=1
+        arable_buffer=arable_buffer,
+        meadow_gdf=meadow_gdf,
+        limitation_full=limitation_full
     )
     pass
 
-    belt_classify_main_gulch(
+    # _, belt_line = belt_calculate_centerlines(
+    #     region='Липецкая область',
+    #     polygons_gdf=arable_buffer_eliminate,
+    #     segmentize_maxlen_m = 5.0,   # densify polygon boundary before centerline
+    #     min_branch_length_m = 100.0,   # prune tiny spurs
+    #     iterations=1
+    # )
+    # pass
+
+    # belt_classify_main_gulch(
+    #     region='Липецкая область',
+    #     belt_line=belt_line,
+    #     arable_gdf=arable_gdf
+    # )
+
+    belt_calculate_forestation(
         region='Липецкая область',
-        belt_line=belt_line,
-        arable_gdf=arable_gdf
+        main_belt=main_belt, 
+        gully_belt=gully_belt, 
+        postgres_info='.secret/.gdcdb',
+        regions_table='admin.hse_russia_regions', 
+        region_buf_size=5000,
+        fabdem_tiles_table='elevation.fabdem_v1_2_tiles',
+        fabdem_zip_path=r"\\172.21.204.20\geodata\_PROJECTS\pkp\vm0047_prod\dem_fabdem",
     )
 
     pass
