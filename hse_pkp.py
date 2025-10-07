@@ -1985,7 +1985,8 @@ def belt_calculate_forestation(
     region_buf_size=5000,
     fabdem_tiles_table='elevation.fabdem_v1_2_tiles',
     fabdem_zip_path=r"\\172.21.204.20\geodata\_PROJECTS\pkp\vm0047_prod\dem_fabdem",
-    tpi_threshold=2
+    tpi_threshold=2,
+    tpi_window_size_m=1000
 ):
     pass
     # Загрузка параметров подключения к PostgreSQL из JSON-файла
@@ -2047,14 +2048,16 @@ def belt_calculate_forestation(
         if input_dem is None:
             print(f"Error: Could not open {os.path.join(fabdemdir, filename)}")
         else:
-            # GDAL's TPI uses a 3x3 window (8 neighbors) by default and this cannot be changed through parameters
-            gdal.DEMProcessing(
-                output_tpi, input_dem, "TPI", 
-                computeEdges=True, 
-                format="GTiff",
-                creationOptions=["COMPRESS=LZW", "TILED=YES"]
-                )
-            pass
+            # # GDAL's TPI uses a 3x3 window (8 neighbors) by default and this cannot be changed through parameters
+            # gdal.DEMProcessing(
+            #     output_tpi, input_dem, "TPI", 
+            #     computeEdges=True, 
+            #     format="GTiff",
+            #     creationOptions=["COMPRESS=LZW", "TILED=YES"]
+            #     )
+            # pass
+            tpi_window_size = tpi_window_size_m / input_dem.RasterXSize #!!!!рассчитать коэффициент
+            calculate_tpi_custom_window(input_dem, output_tpi, window_size=tpi_window_size)
 
         
         # удалить текущие растры
