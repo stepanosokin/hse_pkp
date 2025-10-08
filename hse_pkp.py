@@ -12,6 +12,8 @@ from zipfile import ZipFile
 import os
 import rasterio
 import rasterio.features
+from rasterio.warp import calculate_default_transform, reproject, Resampling
+from rasterio.transform import Affine
 import numpy as np
 from tqdm import tqdm
 import math
@@ -46,16 +48,22 @@ def calculate_tpi_custom_window(input_file, output_file, window_size=5):
         dem = src.read(1, masked=True)
         profile = src.profile.copy()
         
-        # Calculate mean elevation in neighborhood
-        mean_elevation = uniform_filter(
-            dem.filled(np.nan),
-            size=window_size,
-            mode='constant',
-            cval=np.nan
-        )
+        # Convert masked array to regular array with NaN for nodata
+        dem_array = dem.filled(np.nan)
+        
+        # Create a mask for valid data
+        valid_mask = ~np.isnan(dem_array)
+        
+        # Calculate mean elevation in neighborhood, ignoring NaN
+        # Use uniform_filter on valid data and count valid pixels
+        sum_elevation = uniform_filter(np.where(valid_mask, dem_array, 0), size=window_size, mode='constant', cval=0)
+        count_valid = uniform_filter(valid_mask.astype(float), size=window_size, mode='constant', cval=0)
+        
+        # Avoid division by zero
+        mean_elevation = np.where(count_valid > 0, sum_elevation / count_valid, np.nan)
         
         # TPI = elevation - mean of neighbors
-        tpi = dem - mean_elevation
+        tpi = dem_array - mean_elevation
         
         # Handle nodata
         nodata = profile.get('nodata', -9999)
@@ -1986,7 +1994,9 @@ def belt_calculate_forestation(
     fabdem_tiles_table='elevation.fabdem_v1_2_tiles',
     fabdem_zip_path=r"\\172.21.204.20\geodata\_PROJECTS\pkp\vm0047_prod\dem_fabdem",
     tpi_threshold=2,
-    tpi_window_size_m=1000
+    tpi_window_size_m=1000,
+    slope_threshold=12,
+    meadows_raster='lulc/lulc_meadows.tif'
 ):
     pass
     # Загрузка параметров подключения к PostgreSQL из JSON-файла
@@ -2030,6 +2040,7 @@ def belt_calculate_forestation(
     final_gdf = None
 
     for i, row in tqdm(tiles_gdf.iterrows(), desc='tiles loop', total=tiles_gdf.shape[0]):
+        lat = row['geom'].centroid.y
         pass
         # extract current Fabdem tile
         zipfilename = row['zipfile_name']
@@ -2056,9 +2067,207 @@ def belt_calculate_forestation(
             #     creationOptions=["COMPRESS=LZW", "TILED=YES"]
             #     )
             # pass
-            tpi_window_size = tpi_window_size_m / input_dem.RasterXSize #!!!!рассчитать коэффициент
-            calculate_tpi_custom_window(input_dem, output_tpi, window_size=tpi_window_size)
-
+            geotransform = input_dem.GetGeoTransform()
+            m_in_deg = math.sqrt((111132.954 - (559.822 * math.cos(math.radians(2 * lat))) + 1.175 * math.cos(math.radians(4 * lat))) * (111132.954 * math.cos(math.radians(lat))))
+            pixel_size_deg = abs(geotransform[1])
+            # xsize = input_dem.RasterXSize
+            tpi_window_size = tpi_window_size_m / (pixel_size_deg * m_in_deg) #!!!!рассчитать коэффициент
+            tpi_window_size_odd = int(round(tpi_window_size))
+            if tpi_window_size_odd % 2 == 0:
+                # Choose between window_size-1 or window_size+1 based on which is closer
+                if abs(tpi_window_size - (tpi_window_size_odd - 1)) < abs(tpi_window_size - (tpi_window_size_odd + 1)):
+                    tpi_window_size_odd -= 1
+                else:
+                    tpi_window_size_odd += 1
+            
+            # Close GDAL dataset before rasterio opens it
+            input_dem = None
+            
+            calculate_tpi_custom_window(input_file, output_tpi, window_size=tpi_window_size_odd)
+            
+            # Reclass TPI: values < threshold -> nodata, others -> 1
+            with rasterio.open(output_tpi) as src:
+                tpi_data = src.read(1)
+                profile = src.profile.copy()
+                nodata = profile.get('nodata', -9999)
+                
+                # Create reclassified array: 1 where TPI >= threshold, nodata elsewhere
+                reclassed = np.where(tpi_data >= tpi_threshold, 1, nodata)
+                output_tpi_reclassed = os.path.join(fabdemdir, filename.replace('.tif', '_tpi_reclassed.tif'))
+                
+                # Rescale to 10m resolution (10/m_in_deg degrees per pixel)
+                scale_factor = 10 / m_in_deg  # Convert 10 meters to degrees
+                new_pixel_size = scale_factor
+                
+                # Calculate new dimensions
+                old_transform = profile['transform']
+                new_width = int(profile['width'] * abs(old_transform[0]) / new_pixel_size)
+                new_height = int(profile['height'] * abs(old_transform[4]) / new_pixel_size)
+                
+                # Create new transform with rescaled pixel size
+                # from rasterio.transform import Affine
+                new_transform = Affine(new_pixel_size, old_transform[1], old_transform[2],
+                                      old_transform[3], -new_pixel_size, old_transform[5])
+                
+                # Resample the reclassified array
+                # from rasterio.warp import reproject, Resampling
+                reclassed_resampled = np.empty((new_height, new_width), dtype=profile['dtype'])
+                reproject(
+                    source=reclassed,
+                    destination=reclassed_resampled,
+                    src_transform=old_transform,
+                    src_crs=profile['crs'],
+                    dst_transform=new_transform,
+                    dst_crs=profile['crs'],
+                    resampling=Resampling.nearest
+                )
+                
+                # Update profile with new dimensions and transform
+                profile.update({
+                    'width': new_width,
+                    'height': new_height,
+                    'transform': new_transform
+                })
+                
+                # Write rescaled TPI file
+                with rasterio.open(output_tpi_reclassed, 'w', **profile) as dst:
+                    dst.write(reclassed_resampled.astype(profile['dtype']), 1)
+            
+            
+            # Calculate slope
+            # input_dem = None
+            input_dem = gdal.Open(input_file)   
+            output_slope = os.path.join(fabdemdir, filename.replace('.tif', '_slope.tif'))
+            if input_dem is None:
+                print(f"Error: Could not open {os.path.join(fabdemdir, filename)}")
+            else:
+                # https://gdal.org/en/stable/api/python/utilities.html#osgeo.gdal.DEMProcessing
+                # далее несколько вариантов расчета вертикального масштаба при вычислении slope, подсказанные GPT-5 (low reasoning)
+                # scale = 1             # Это если в метрах
+                # scale = 111320        # Это если в градусах и без учета широты
+                # scale = 111320 * math.cos(math.radians(lat))      # Это если в градусах и по упрощенной формуле только с учетом масштаба по долготе в зависимости от широты
+                # scale = 111132.954 * math.cos(math.radians(lat))  # Это если в градусах и по упрощенной формуле с учетом масштаба по долготе в зависимости от широты, с уточненным коэффициентом
+                scale = math.sqrt((111132.954 - (559.822 * math.cos(math.radians(2 * lat))) + 1.175 * math.cos(math.radians(4 * lat))) * (111132.954 * math.cos(math.radians(lat))))  # Это если в градусах, по самой точной формуле как среднее геометрическое масштабов по долготе и широте в зависимости от широты
+                gdal.DEMProcessing(
+                    output_slope, input_dem, "slope", 
+                    computeEdges=True, slopeFormat="degree", scale=scale   # Это если в градусах
+                    )
+                input_dem = None
+                # Reclass Slope: values < threshold -> nodata, others -> 1
+                with rasterio.open(output_slope) as src:
+                    slope_data = src.read(1)
+                    profile = src.profile.copy()
+                    nodata = profile.get('nodata', -9999)
+                    
+                    # Create reclassified array: 1 where slope < threshold, nodata elsewhere
+                    reclassed = np.where(slope_data < slope_threshold, 1, nodata)
+                    output_slope_reclassed = os.path.join(fabdemdir, filename.replace('.tif', '_slope_reclassed.tif'))
+                    
+                    # Rescale to 10m resolution (10/m_in_deg degrees per pixel)
+                    scale_factor = 10 / m_in_deg  # Convert 10 meters to degrees
+                    new_pixel_size = scale_factor
+                    
+                    # Calculate new dimensions
+                    old_transform = profile['transform']
+                    new_width = int(profile['width'] * abs(old_transform[0]) / new_pixel_size)
+                    new_height = int(profile['height'] * abs(old_transform[4]) / new_pixel_size)
+                    
+                    # Create new transform with rescaled pixel size
+                    new_transform = Affine(new_pixel_size, old_transform[1], old_transform[2],
+                                          old_transform[3], -new_pixel_size, old_transform[5])
+                    
+                    # Resample the reclassified array
+                    reclassed_resampled = np.empty((new_height, new_width), dtype=profile['dtype'])
+                    reproject(
+                        source=reclassed,
+                        destination=reclassed_resampled,
+                        src_transform=old_transform,
+                        src_crs=profile['crs'],
+                        dst_transform=new_transform,
+                        dst_crs=profile['crs'],
+                        resampling=Resampling.nearest
+                    )
+                    
+                    # Update profile with new dimensions and transform
+                    profile.update({
+                        'width': new_width,
+                        'height': new_height,
+                        'transform': new_transform
+                    })
+                    
+                    # Write rescaled slope file
+                    with rasterio.open(output_slope_reclassed, 'w', **profile) as dst:
+                        dst.write(reclassed_resampled.astype(profile['dtype']), 1)
+                pass
+                
+                
+                
+            # Open meadows raster and reproject to EPSG:4326                
+            with rasterio.open(meadows_raster) as src_meadows:
+                # Get transform and dimensions for EPSG:4326 matching the DEM tile
+                with rasterio.open(output_tpi_reclassed) as ref:
+                    dst_crs = 'EPSG:4326'
+                    dst_transform = ref.transform
+                    dst_width = ref.width
+                    dst_height = ref.height
+                    dst_bounds = ref.bounds
+                
+                # Read source data
+                src_data = src_meadows.read(1)
+                
+                # Create output array
+                dst_data = np.empty((dst_height, dst_width), dtype=src_meadows.dtypes[0])
+                
+                # Reproject
+                reproject(
+                    source=src_data,
+                    destination=dst_data,
+                    src_transform=src_meadows.transform,
+                    src_crs=src_meadows.crs,
+                    dst_transform=dst_transform,
+                    dst_crs=dst_crs,
+                    resampling=Resampling.nearest
+                )
+                
+                # Save reprojected meadows
+                meadows_reprojected = os.path.join(fabdemdir, filename.replace('.tif', '_meadows.tif'))
+                profile_meadows = src_meadows.profile.copy()
+                profile_meadows.update({
+                    'crs': dst_crs,
+                    'transform': dst_transform,
+                    'width': dst_width,
+                    'height': dst_height
+                })
+                
+                with rasterio.open(meadows_reprojected, 'w', **profile_meadows) as dst:
+                    dst.write(dst_data, 1)
+            pass
+        
+            # Multiply the three rasters: TPI, Slope, and Meadows
+            with rasterio.open(output_tpi_reclassed) as src_tpi:
+                tpi_data = src_tpi.read(1)
+                profile = src_tpi.profile.copy()
+                nodata = profile.get('nodata', -9999)
+            
+            with rasterio.open(output_slope_reclassed) as src_slope:
+                slope_data = src_slope.read(1)
+            
+            with rasterio.open(meadows_reprojected) as src_meadows:
+                meadows_data = src_meadows.read(1)
+                meadows_nodata = src_meadows.profile.get('nodata', -9999)
+            
+            # Multiply: result will be 1 only where all three are 1
+            result = tpi_data * slope_data * meadows_data
+            
+            # Handle nodata: if any input is nodata, output should be nodata
+            result = np.where((tpi_data == nodata) | (slope_data == nodata) | (meadows_data == meadows_nodata), 
+                              nodata, result)
+            
+            # Save the result
+            forestation_raster = os.path.join(fabdemdir, filename.replace('.tif', '_forestation.tif'))
+            with rasterio.open(forestation_raster, 'w', **profile) as dst:
+                dst.write(result.astype(profile['dtype']), 1)
+            pass
         
         # удалить текущие растры
         for fl in [ 
@@ -2667,13 +2876,13 @@ if __name__ == '__main__':
     # )
     # pass
 
-    arable_buffer_eliminate = belt_calculate_arable_buffer_eliminate(
-        region='Липецкая область',
-        arable_buffer=arable_buffer,
-        meadow_gdf=meadow_gdf,
-        limitation_full=limitation_full
-    )
-    pass
+    # arable_buffer_eliminate = belt_calculate_arable_buffer_eliminate(
+    #     region='Липецкая область',
+    #     arable_buffer=arable_buffer,
+    #     meadow_gdf=meadow_gdf,
+    #     limitation_full=limitation_full
+    # )
+    # pass
 
     # _, belt_line = belt_calculate_centerlines(
     #     region='Липецкая область',
@@ -2699,6 +2908,7 @@ if __name__ == '__main__':
         region_buf_size=5000,
         fabdem_tiles_table='elevation.fabdem_v1_2_tiles',
         fabdem_zip_path=r"\\172.21.204.20\geodata\_PROJECTS\pkp\vm0047_prod\dem_fabdem",
+        meadows_raster='lulc/lulc_meadows.tif'
     )
 
     pass
