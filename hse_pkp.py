@@ -21,7 +21,6 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.ndimage import gaussian_filter1d
 from centerline.geometry import Centerline
-import math
 import networkx as nx
 
 # Сложности https://github.com/astral-sh/uv/issues/11466
@@ -559,7 +558,8 @@ def calculate_geod_buffers(
     buffer_crs: str,
     buffer_dist_source: str,
     buffer_distance,
-    geom_field='geom'
+    geom_field='geom',
+    single_sided=False
 ):
     """_summary_
 
@@ -575,12 +575,21 @@ def calculate_geod_buffers(
     Returns:
         list: Список с геометриями буферов
     """
+    i_gdf_geom_name = i_gdf.geometry.name
+    # Проверка типа геометрии для single_sided буфера
+    if single_sided and not i_gdf.empty:
+        geom_type = i_gdf[i_gdf_geom_name].iloc[0].geom_type
+        if geom_type not in ['LineString', 'MultiLineString']:
+            single_sided = False
+    
     # Расчет буферов вокруг линейных водных объектов
     buffer_geom = []
+    
+
     for i, row in i_gdf.iterrows():   # итерация по линейным объектам
         # формирование проекции UTM с центральным меридианом в центроиде текущего объекта
-        lon = row[geom_field].centroid.x
-        lat = row[geom_field].centroid.y
+        lon = row[i_gdf_geom_name].centroid.x
+        lat = row[i_gdf_geom_name].centroid.y
         if buffer_crs == 'utm':
             buf_crs = crs.CRS.from_proj4(
                 f"+proj=tmerc +lat_0=0 +lon_0={lon} " \
@@ -600,9 +609,9 @@ def calculate_geod_buffers(
         # вычисление буфера в текущей проекции UTM
         try:
             if buffer_dist_source == 'value':
-                buffer = shapely.buffer(shapely.transform(row[geom_field], transformer1.transform, interleaved=False), float(buffer_distance))
+                buffer = shapely.buffer(shapely.transform(row[i_gdf_geom_name], transformer1.transform, interleaved=False), float(buffer_distance), single_sided=single_sided)
             elif buffer_dist_source == 'field':
-                buffer = shapely.buffer(shapely.transform(row[geom_field], transformer1.transform, interleaved=False), float(row[buffer_distance]))
+                buffer = shapely.buffer(shapely.transform(row[i_gdf_geom_name], transformer1.transform, interleaved=False), float(row[buffer_distance]), single_sided=single_sided)
             else:
                 raise ValueError("Неверно задан параметр buffer_dist_source")
             # Пересчет буфера обратно в WGS-1984
@@ -2375,16 +2384,121 @@ def belt_calculate_forestation(
             layer=f'{region_shortname}_forestation'
         )
     return final_gdf
+
+
+def belt_calculate_secondary_belt(
+    postgres_info: str='.secret/.gdcdb',
+    region: str='Липецкая область',
+    regions_table: str='admin.hse_russia_regions',
+    region_buf_size: int=5000,
+    road_table: str='osm.gis_osm_roads_free',
+    road_one_side_buf_size_m: int=6,
+    limitation_full: gpd.GeoDataFrame=None,
+    main_belt: gpd.GeoDataFrame=None,
+    gully_belt: gpd.GeoDataFrame=None,
+    main_gully_belt_buf_size_m: int=20,
+    meadow_gdf: gpd.GeoDataFrame=None
+):
+    region_shortname = get_region_shortname(region)
+    if region_shortname is None:
+        region_shortname = "region"
+    current_dir = os.getcwd()
+
+    for nm, g in {
+        "limitation_full": limitation_full, 
+        "main_belt": main_belt, 
+        "gully_belt": gully_belt, 
+        "meadow_gdf": meadow_gdf
+        }.items():
+        if g is None or g.empty:
+            raise ValueError(f"{nm} is None or empty")
+    pass
+    try:
+        with open(postgres_info, encoding='utf-8') as f:
+            pg = json.load(f)
+    except:
+        raise
+    try:
+        engine = sqlalchemy.create_engine(
+            f"postgresql+psycopg2://{pg['user']}:{pg['password']}@{pg['host']}:{pg['port']}/{pg['database']}",
+            connect_args={
+                "sslmode": "verify-full",
+                "target_session_attrs": "read-write"
+            },
+        )
+    except:
+        raise
+    try:
+        sql = f"select gid, fclass, osm_id, " \
+            f"ST_Buffer(geom::geography, {road_one_side_buf_size_m}, 'side=right')::geometry as geom " \
+            f"from {road_table} road " \
+            f"where (ST_Intersects(" \
+            f"(select "
+        if region_buf_size > 0:
+            sql += f"ST_Buffer(geom::geography, {region_buf_size})::geometry "
+        else:
+            sql += "geom "
+        sql += f"from {regions_table} where lower(region) = '{region.lower()}' limit 1), " \
+        f"road.geom" \
+        f")) " \
+        f"and (road.fclass in " \
+            f"('track', 'track_grade1', 'track_grade2', 'track_grade3', 'track_grade4', 'track_grade5')" \
+            f");"
+
+        with engine.connect() as conn:
+            secondary_belt_gdf = gpd.read_postgis(sql, conn)        
+        pass        
+    except: 
+        raise
     
+    # Calculate difference between secondary_belt_gdf and limitation_full
+    if limitation_full is not None and not limitation_full.empty:
+        # Ensure both GeoDataFrames have the same CRS
+        if secondary_belt_gdf.crs != limitation_full.crs:
+            limitation_full = limitation_full.to_crs(secondary_belt_gdf.crs)        
+        # Perform overlay to subtract limitations from secondary belt
+        secondary_belt_gdf = gpd.overlay(secondary_belt_gdf, limitation_full, how='difference')
+    
+    main_belt_buf = calculate_geod_buffers(main_belt, 'utm', 'value', main_gully_belt_buf_size_m)
+    main_belt = main_belt.copy().set_geometry(main_belt_buf)
+    gully_belt_buf = calculate_geod_buffers(gully_belt, 'utm', 'value', main_gully_belt_buf_size_m)
+    gully_belt = gully_belt.copy().set_geometry(gully_belt_buf)        
+    secondary_belt_gdf = gpd.overlay(secondary_belt_gdf, main_belt, how='difference')
+    secondary_belt_gdf = gpd.overlay(secondary_belt_gdf, gully_belt, how='difference')
+    secondary_belt_gdf = gpd.overlay(secondary_belt_gdf, meadow_gdf, how='difference')
+    
+    # Calculate geodesic area in hectares
+    # secondary_belt_gdf = secondary_belt_gdf.to_crs(4326)
+    geod = Geod(ellps='WGS84')
+    geom_col_name = secondary_belt_gdf.geometry.name
+    areas_ha = []
+    for i, row in secondary_belt_gdf.iterrows():
+        geom = row[geom_col_name]
+        if geom is None or geom.is_empty:
+            areas_ha.append(0.0)
+            continue
+        try:
+            area_m2, _ = geod.geometry_area_perimeter(geom)
+            areas_ha.append(abs(area_m2) / 10000.0)
+        except Exception:
+            areas_ha.append(0.0)
+    secondary_belt_gdf['area_ha'] = areas_ha
+    
+    secondary_belt_gdf = secondary_belt_gdf[secondary_belt_gdf['area_ha'] > 0.1].copy()
+    secondary_belt_gdf.to_file(
+            os.path.join(current_dir, 'result', f'{region_shortname}_limitations.gpkg'),
+            layer=f'{region_shortname}_secondary_belt'
+        )
+    return secondary_belt_gdf
 
     
 def calculate_forest_belt(
-    region='Липецкая область',
-    limitations_all=None,   # geodataframe derived from prepare_limitations
-    lulc_link='lulc/S2LULC_10m_LAEA_48_202507081046.tif',
-    postgres_info='.secret/.gdcdb',
-    regions_table='admin.hse_russia_regions',
-    region_buf_size=5000,
+    region: str='Липецкая область',
+    limitations_all: gpd.GeoDataFrame=None,   # geodataframe derived from prepare_limitations
+    lulc_link: str='lulc/S2LULC_10m_LAEA_48_202507081046.tif',
+    postgres_info: str='.secret/.gdcdb',
+    regions_table: str='admin.hse_russia_regions',
+    region_buf_size: int=5000,
     road_table='osm.gis_osm_roads_free',
     road_buf_size_rule={
         "fclass  in  ('primary', 'primary_link')": 80,
@@ -2943,6 +3057,10 @@ if __name__ == '__main__':
         'result/Lipetskaya_Limitations.gpkg', 
         layer='Lipetskaya_forestation'
         )
+    secondary_belt = gpd.read_file(
+        'result/Lipetskaya_Limitations.gpkg', 
+        layer='Lipetskaya_secondary_belt'
+        )
 
 
     region_shortname = get_region_shortname('Липецкая область')
@@ -2951,7 +3069,8 @@ if __name__ == '__main__':
 
     # lulc_gdfs = belt_vectorize_lulc(
     #         region='Липецкая область',
-    #         lulc_link='lulc/S2LULC_10m_LAEA_48_202507081046_sample.tif'
+    #         # lulc_link='lulc/S2LULC_10m_LAEA_48_202507081046_sample.tif',
+    #         lulc_link='lulc/S2LULC_10m_LAEA_48_202507081046.tif',
     #         )
     # water_gdf = lulc_gdfs.get('water_gdf')
     # forest_gdf = lulc_gdfs.get('forest_gdf')
@@ -2963,6 +3082,7 @@ if __name__ == '__main__':
     #         os.path.join(current_dir, 'result', f'{region_shortname}_lulc.gpkg'), 
     #         layer=f"{region_shortname}_lulc_{name.replace('_gdf', '')}"
     #         )
+    # pass
     
     # forest_50m = belt_calculate_forest_buffer(
     #     region='Липецкая область',
@@ -2994,13 +3114,13 @@ if __name__ == '__main__':
     # )
     # pass
 
-    # arable_buffer = belt_calculate_arable_buffer(
-    #     region='Липецкая область',
-    #     arable_gdf=arable_gdf,
-    #     arable_area_ha_threshold=10,
-    #     arable_buffer_distance=20
-    # )
-    # pass
+    arable_buffer = belt_calculate_arable_buffer(
+        region='Липецкая область',
+        arable_gdf=arable_gdf,
+        arable_area_ha_threshold=10,
+        arable_buffer_distance=20
+    )
+    pass
 
     # arable_buffer_eliminate = belt_calculate_arable_buffer_eliminate(
     #     region='Липецкая область',
@@ -3019,27 +3139,40 @@ if __name__ == '__main__':
     # )
     # pass
 
-    main_belt, gully_belt = belt_classify_main_gulch(
-        region='Липецкая область',
-        belt_line=belt_line,
-        arable_gdf=arable_gdf
-    )
+    # main_belt, gully_belt = belt_classify_main_gulch(
+    #     region='Липецкая область',
+    #     belt_line=belt_line,
+    #     arable_gdf=arable_gdf
+    # )
 
-    forestation = belt_calculate_forestation(
-        region='Липецкая область',
-        main_belt=main_belt, 
-        gully_belt=gully_belt, 
-        limitation_full=limitation_full,
-        postgres_info='.secret/.gdcdb',
-        regions_table='admin.hse_russia_regions', 
-        region_buf_size=5000,
-        fabdem_tiles_table='elevation.fabdem_v1_2_tiles',
-        fabdem_zip_path=r"\\172.21.204.20\geodata\_PROJECTS\pkp\vm0047_prod\dem_fabdem",
-        meadows_raster='lulc/lulc_meadows.tif',
-        tpi_threshold=2,
-        tpi_window_size_m=1000,
-        slope_threshold=12
-    )
+    # forestation = belt_calculate_forestation(
+    #     region='Липецкая область',
+    #     main_belt=main_belt, 
+    #     gully_belt=gully_belt, 
+    #     limitation_full=limitation_full,
+    #     postgres_info='.secret/.gdcdb',
+    #     regions_table='admin.hse_russia_regions', 
+    #     region_buf_size=5000,
+    #     fabdem_tiles_table='elevation.fabdem_v1_2_tiles',
+    #     fabdem_zip_path=r"\\172.21.204.20\geodata\_PROJECTS\pkp\vm0047_prod\dem_fabdem",
+    #     meadows_raster='lulc/lulc_meadows.tif',
+    #     tpi_threshold=2,
+    #     tpi_window_size_m=1000,
+    #     slope_threshold=12
+    # )
+
+    # belt_calculate_secondary_belt(
+    #     postgres_info='.secret/.gdcdb',
+    #     region='Липецкая область',
+    #     regions_table='admin.hse_russia_regions',
+    #     region_buf_size=5000,
+    #     road_table='osm.gis_osm_roads_free',
+    #     road_one_side_buf_size_m=6,
+    #     limitation_full=limitation_full,
+    #     main_belt=main_belt,
+    #     gully_belt=gully_belt,
+    #     meadow_gdf=meadow_gdf
+    # )
 
     pass
     # prepare_road_limitations(
