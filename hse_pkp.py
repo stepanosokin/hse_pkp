@@ -74,7 +74,7 @@ def calculate_tpi_custom_window(input_file, output_file, window_size=5):
             dst.write(tpi_filled.astype(profile['dtype']), 1)
 
 
-def gaussian_smooth_polygon(geom, sigma=2):
+def gaussian_smooth(geom, sigma=2):
     if geom.geom_type == 'Polygon':
         coords = np.array(geom.exterior.coords)
         # Smooth x and y separately
@@ -84,10 +84,23 @@ def gaussian_smooth_polygon(geom, sigma=2):
         return shapely.geometry.Polygon(smoothed_coords)
     elif geom.geom_type == 'MultiPolygon':
         smoothed_parts = [
-            gaussian_smooth_polygon(poly, sigma) 
+            gaussian_smooth(poly, sigma) 
             for poly in geom.geoms
         ]
         return shapely.geometry.MultiPolygon(smoothed_parts)
+    elif geom.geom_type == 'LineString':
+        coords = np.array(geom.coords)
+        # For LineStrings, use 'nearest' mode instead of 'wrap' to avoid connecting endpoints
+        x_smooth = gaussian_filter1d(coords[:, 0], sigma=sigma, mode='nearest')
+        y_smooth = gaussian_filter1d(coords[:, 1], sigma=sigma, mode='nearest')
+        smoothed_coords = np.column_stack([x_smooth, y_smooth])
+        return shapely.geometry.LineString(smoothed_coords)
+    elif geom.geom_type == 'MultiLineString':
+        smoothed_parts = [
+            gaussian_smooth(line, sigma) 
+            for line in geom.geoms
+        ]
+        return shapely.geometry.MultiLineString(smoothed_parts)
     return geom
 
 
@@ -929,6 +942,7 @@ def prepare_slope_limitations(
         # Rescaling with improved options
         output_rescale = None
         if rescale:
+            scale = math.sqrt((111132.954 - (559.822 * math.cos(math.radians(2 * lat))) + 1.175 * math.cos(math.radians(4 * lat))) * (111132.954 * math.cos(math.radians(lat))))
             rescale_options = gdal.WarpOptions(
                 # xRes=rescale_size,
                 # yRes=rescale_size,
@@ -979,7 +993,7 @@ def prepare_slope_limitations(
         output_slope_reclass = os.path.join(fabdemdir, filename.replace('.tif', '_slope_reclass.tif'))
         calc_expression = f"(A>={slope_threshold})*1"
         ds = gdal_calc.Calc(calc_expression, A=output_slope, outfile=output_slope_reclass, overwrite=True)
-        pass
+        
         
         # Vectorize reclassed slope
         # https://www.google.com/search?q=python+rasterio+polygonize&sca_esv=7550878c098e0420&ei=AqK5aIbtPLqbwPAPxvCE6A8&ved=0ahUKEwiG9ujCqL-PAxW6DRAIHUY4Af0Q4dUDCBA&uact=5&oq=python+rasterio+polygonize&gs_lp=Egxnd3Mtd2l6LXNlcnAiGnB5dGhvbiByYXN0ZXJpbyBwb2x5Z29uaXplMgUQABjvBTIFEAAY7wUyBRAAGO8FSMUYUPQGWMIRcAF4AZABAJgBhwGgAbIEqgEDNy4xuAEDyAEA-AEBmAIIoALCA8ICChAAGLADGNYEGEfCAggQABgHGAgYHsICCBAAGIAEGKIEwgILEAAYgAQYhgMYigXCAgYQABgIGB6YAwCIBgGQBgiSBwE4oAfaFrIHATe4B7kDwgcFMC43LjHIBxM&sclient=gws-wiz-serp
@@ -1007,6 +1021,9 @@ def prepare_slope_limitations(
             # gdf.to_file('result/slope_limitations.gpkg', layer=filename.replace('.tif', '_slope'))
         ds = None
         input_dem = None
+        # if row['tile_name'] == 'N052E038':
+        #     pass
+        # pass
         # Delete intermediate rasters
         for fl in [
             output_slope, 
@@ -1730,7 +1747,7 @@ def belt_calculate_arable_buffer_eliminate(
         # g_proj["geometry"] = g_proj.apply(lambda row: chaikin_smooth(row["geometry"], iterations=10), axis=1)
         
         # option d: gaussian smooth (from Claude Sonnet 4.5)
-        g_proj["geometry"] = g_proj["geometry"].apply(lambda geom: gaussian_smooth_polygon(geom, sigma=1))
+        g_proj["geometry"] = g_proj["geometry"].apply(lambda geom: gaussian_smooth(geom, sigma=1))
         
         arable_buffer_smooth = g_proj.to_crs(4326)
 
@@ -1767,9 +1784,10 @@ def belt_calculate_centerlines(
     region='Липецкая область',
     polygons_gdf=None,
     segmentize_maxlen_m = 0.5,   # densify polygon boundary before centerline
-    min_branch_length_m = 0,   # prune tiny spurs
+    min_branch_length_m = 100,   # prune tiny spurs
     geometry_field='geometry',
-    iterations=1
+    iterations=1,
+    write_output=True
 ):
     # Compute vector centerlines using the 'centerline' library.
     # 1) Project polygons to a local metric CRS (LAEA centered on bbox)
@@ -1868,12 +1886,13 @@ def belt_calculate_centerlines(
     arable_buffer_line = lines_gdf.to_crs(4326)
 
     # Save result
-    try:
-        out_path = os.path.join("result", f"{region_shortname}_limitations.gpkg")
-        layer_name = f"{region_shortname}_arable_buffer_line"
-        arable_buffer_line.to_file(out_path, layer=layer_name)
-    except Exception as e:
-        print(f"Warning: failed to save centerlines: {e}")
+    if write_output:
+        try:
+            out_path = os.path.join("result", f"{region_shortname}_limitations.gpkg")
+            layer_name = f"{region_shortname}_arable_buffer_line"
+            arable_buffer_line.to_file(out_path, layer=layer_name)
+        except Exception as e:
+            print(f"Warning: failed to save centerlines: {e}")
 
     belt_line = arable_buffer_line.reset_index(drop=True).copy()
     # belt_line["belt_id"] = belt_line.index + 1
@@ -1882,12 +1901,13 @@ def belt_calculate_centerlines(
     belt_line["buf_dist"] = 0
 
     # Save result
-    try:
-        out_path = os.path.join("result", f"{region_shortname}_limitations.gpkg")
-        layer_name = f"{region_shortname}_belt_line"
-        belt_line.to_file(out_path, layer=layer_name)
-    except Exception as e:
-        print(f"Warning: failed to save centerlines: {e}")
+    if write_output:
+        try:
+            out_path = os.path.join("result", f"{region_shortname}_limitations.gpkg")
+            layer_name = f"{region_shortname}_belt_line"
+            belt_line.to_file(out_path, layer=layer_name)
+        except Exception as e:
+            print(f"Warning: failed to save centerlines: {e}")
 
     return arable_buffer_line, belt_line
 
@@ -2361,7 +2381,7 @@ def belt_calculate_forestation(
                 os.path.join(current_dir, 'result', f'{region_shortname}_limitations.gpkg'),
                 layer=f'{region_shortname}_forestation_beforeSmooth'
                 )
-        final_gdf["geometry"] = final_gdf["geometry"].apply(lambda geom: gaussian_smooth_polygon(geom, sigma=1))
+        final_gdf["geometry"] = final_gdf["geometry"].apply(lambda geom: gaussian_smooth(geom, sigma=1))
         final_gdf = final_gdf.to_crs(4326)
         
         # Расчет площади и фильтрация
@@ -2467,6 +2487,8 @@ def belt_calculate_secondary_belt(
     secondary_belt_gdf = gpd.overlay(secondary_belt_gdf, gully_belt, how='difference')
     secondary_belt_gdf = gpd.overlay(secondary_belt_gdf, meadow_gdf, how='difference')
     
+    secondary_belt_gdf = secondary_belt_gdf.explode()
+
     # Calculate geodesic area in hectares
     # secondary_belt_gdf = secondary_belt_gdf.to_crs(4326)
     geod = Geod(ellps='WGS84')
@@ -2485,6 +2507,37 @@ def belt_calculate_secondary_belt(
     secondary_belt_gdf['area_ha'] = areas_ha
     
     secondary_belt_gdf = secondary_belt_gdf[secondary_belt_gdf['area_ha'] > 0.1].copy()
+    
+    # Calculate centerlines for secondary belt polygons using Voronoi-based algorithm
+    _, secondary_belt_gdf_centrl = belt_calculate_centerlines(
+        region=region,
+        polygons_gdf=secondary_belt_gdf,
+        segmentize_maxlen_m = 5.0,   # densify polygon boundary before centerline
+        min_branch_length_m = 100.0,   # prune tiny spurs
+        iterations=1,
+        write_output=False
+    )
+    # Apply gaussian smoothing to centerlines to reduce jaggedness
+    centrl_geom_col = secondary_belt_gdf_centrl.geometry.name
+    secondary_belt_gdf_centrl[centrl_geom_col] = secondary_belt_gdf_centrl[centrl_geom_col].apply(lambda geom: gaussian_smooth(geom, sigma=1))
+    
+    # Calculate 3m geodesic buffers around centerlines
+    secondary_belt_centrl_buf = calculate_geod_buffers(
+        secondary_belt_gdf_centrl,
+        'utm',
+        'value',
+        3
+    )
+    secondary_belt_gdf = secondary_belt_gdf.copy().set_geometry(secondary_belt_centrl_buf)
+    
+    # Save smoothed centerlines to GeoPackage
+    if secondary_belt_gdf_centrl is not None and not secondary_belt_gdf_centrl.empty:
+        secondary_belt_gdf_centrl.to_file(
+                os.path.join(current_dir, 'result', f'{region_shortname}_limitations.gpkg'),
+                layer=f'{region_shortname}_secondary_belt_centrl'
+            )
+        pass
+    
     secondary_belt_gdf.to_file(
             os.path.join(current_dir, 'result', f'{region_shortname}_limitations.gpkg'),
             layer=f'{region_shortname}_secondary_belt'
@@ -3114,13 +3167,13 @@ if __name__ == '__main__':
     # )
     # pass
 
-    arable_buffer = belt_calculate_arable_buffer(
-        region='Липецкая область',
-        arable_gdf=arable_gdf,
-        arable_area_ha_threshold=10,
-        arable_buffer_distance=20
-    )
-    pass
+    # arable_buffer = belt_calculate_arable_buffer(
+    #     region='Липецкая область',
+    #     arable_gdf=arable_gdf,
+    #     arable_area_ha_threshold=10,
+    #     arable_buffer_distance=20
+    # )
+    # pass
 
     # arable_buffer_eliminate = belt_calculate_arable_buffer_eliminate(
     #     region='Липецкая область',
@@ -3161,18 +3214,18 @@ if __name__ == '__main__':
     #     slope_threshold=12
     # )
 
-    # belt_calculate_secondary_belt(
-    #     postgres_info='.secret/.gdcdb',
-    #     region='Липецкая область',
-    #     regions_table='admin.hse_russia_regions',
-    #     region_buf_size=5000,
-    #     road_table='osm.gis_osm_roads_free',
-    #     road_one_side_buf_size_m=6,
-    #     limitation_full=limitation_full,
-    #     main_belt=main_belt,
-    #     gully_belt=gully_belt,
-    #     meadow_gdf=meadow_gdf
-    # )
+    belt_calculate_secondary_belt(
+        postgres_info='.secret/.gdcdb',
+        region='Липецкая область',
+        regions_table='admin.hse_russia_regions',
+        region_buf_size=5000,
+        road_table='osm.gis_osm_roads_free',
+        road_one_side_buf_size_m=6,
+        limitation_full=limitation_full,
+        main_belt=main_belt,
+        gully_belt=gully_belt,
+        meadow_gdf=meadow_gdf
+    )
 
     pass
     # prepare_road_limitations(
