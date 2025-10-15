@@ -22,6 +22,7 @@ from scipy.sparse.csgraph import connected_components
 from scipy.ndimage import gaussian_filter1d
 from centerline.geometry import Centerline
 import networkx as nx
+import whitebox_workflows as wbt
 
 # Сложности https://github.com/astral-sh/uv/issues/11466
 from osgeo import gdal
@@ -818,7 +819,8 @@ def prepare_slope_limitations(
     fabdem_tiles_table='elevation.fabdem_v1_2_tiles',
     fabdem_zip_path=r"\\172.21.204.20\geodata\_PROJECTS\pkp\vm0047_prod\dem_fabdem",
     rescale=True,
-    rescale_size=10
+    rescale_size=10,
+    use_wbw=True
     ):
     """Формирует ограничения по уклонам рельефа для указанного региона на основе тайлов DEM FABDEM.
 
@@ -915,6 +917,7 @@ def prepare_slope_limitations(
         except:
             raise
         input_file = os.path.join(fabdemdir, filename)
+        
         input_dem = gdal.Open(input_file)
         
         # # reproject       # Перепроецирование в итоге убрали
@@ -972,22 +975,38 @@ def prepare_slope_limitations(
         # input_dem = None
         # input_dem = gdal.Open(output_rescale)        
         output_slope = os.path.join(fabdemdir, filename.replace('.tif', '_slope.tif'))
-        if input_dem is None:
-            print(f"Error: Could not open {os.path.join(fabdemdir, filename)}")
+        if not use_wbw:
+            if input_dem is None:
+                print(f"Error: Could not open {os.path.join(fabdemdir, filename)}")
+            else:
+                # https://gdal.org/en/stable/api/python/utilities.html#osgeo.gdal.DEMProcessing
+                # далее несколько вариантов расчета вертикального масштаба при вычислении slope, подсказанные GPT-5 (low reasoning)
+                # scale = 1             # Это если в метрах
+                # scale = 111320        # Это если в градусах и без учета широты
+                # scale = 111320 * math.cos(math.radians(lat))      # Это если в градусах и по упрощенной формуле только с учетом масштаба по долготе в зависимости от широты
+                # scale = 111132.954 * math.cos(math.radians(lat))  # Это если в градусах и по упрощенной формуле с учетом масштаба по долготе в зависимости от широты, с уточненным коэффициентом
+                scale = math.sqrt((111132.954 - (559.822 * math.cos(math.radians(2 * lat))) + 1.175 * math.cos(math.radians(4 * lat))) * (111132.954 * math.cos(math.radians(lat))))  # Это если в градусах, по самой точной формуле как среднее геометрическое масштабов по долготе и широте в зависимости от широты
+                gdal.DEMProcessing(
+                    output_slope, input_dem, "slope", 
+                    computeEdges=True, slopeFormat="degree", scale=scale   # Это если в градусах
+                    )
+                # print(f"Slope calculated and saved to {output_slope}")
+                pass
         else:
-            # https://gdal.org/en/stable/api/python/utilities.html#osgeo.gdal.DEMProcessing
-            # далее несколько вариантов расчета вертикального масштаба при вычислении slope, подсказанные GPT-5 (low reasoning)
-            # scale = 1             # Это если в метрах
-            # scale = 111320        # Это если в градусах и без учета широты
-            # scale = 111320 * math.cos(math.radians(lat))      # Это если в градусах и по упрощенной формуле только с учетом масштаба по долготе в зависимости от широты
-            # scale = 111132.954 * math.cos(math.radians(lat))  # Это если в градусах и по упрощенной формуле с учетом масштаба по долготе в зависимости от широты, с уточненным коэффициентом
-            scale = math.sqrt((111132.954 - (559.822 * math.cos(math.radians(2 * lat))) + 1.175 * math.cos(math.radians(4 * lat))) * (111132.954 * math.cos(math.radians(lat))))  # Это если в градусах, по самой точной формуле как среднее геометрическое масштабов по долготе и широте в зависимости от широты
-            gdal.DEMProcessing(
-                output_slope, input_dem, "slope", 
-                computeEdges=True, slopeFormat="degree", scale=scale   # Это если в градусах
-                )
-            # print(f"Slope calculated and saved to {output_slope}")
+            # Use WhiteboxTools to calculate geodesic slope
+            # Create environment
+            wbe = wbt.WbEnvironment()
+            wbe.working_directory = fabdemdir
+            # Read DEM
+            dem = wbe.read_raster(output_rescale)
+            if output_rescale is not None:
+                # Calculate slope
+                slope_raster = wbe.slope(dem, units='degrees')
+                wbe.write_raster(slope_raster, output_slope)
             pass
+            if row['tile_name'] == 'N052E038':
+                pass
+            
         
         # Reclass slope
         output_slope_reclass = os.path.join(fabdemdir, filename.replace('.tif', '_slope_reclass.tif'))
@@ -1021,9 +1040,9 @@ def prepare_slope_limitations(
             # gdf.to_file('result/slope_limitations.gpkg', layer=filename.replace('.tif', '_slope'))
         ds = None
         input_dem = None
-        # if row['tile_name'] == 'N052E038':
-        #     pass
-        # pass
+        if row['tile_name'] == 'N052E038':
+            pass
+        pass
         # Delete intermediate rasters
         for fl in [
             output_slope, 
@@ -1331,6 +1350,7 @@ def belt_vectorize_lulc(
     lulc_link='lulc/S2LULC_10m_LAEA_48_202507081046.tif'
 ):
     ######################LULC######################
+    print("vectorizing LULC raster...")
     current_dir = os.getcwd()
     region_shortname = get_region_shortname(region)
     if region_shortname is None:
@@ -1455,6 +1475,7 @@ def belt_calculate_forest_buffer(
     forest_gdf=None,
     buffer_distance=50
 ):
+    print("calculating buffer around forests from LULC...")
     region_shortname = get_region_shortname(region)
     if region_shortname is None:
         region_shortname = "region"
@@ -1503,6 +1524,7 @@ def belt_merge_limitation_full(
     road_OSM_cover_buf=None,   # geodataframe derived from calculate_road_buffer
     forest_50m=None,   # geodataframe derived from calculate_forest_buffer
 ):
+    print("calculating full limitations...")
     ###################объединение ограничений########################
     if limitations_all is not None and road_OSM_cover_buf is not None and forest_50m is not None:
         ############################################
@@ -1618,6 +1640,7 @@ def belt_calculate_arable_buffer(
     arable_area_ha_threshold=10,
     arable_buffer_distance=20,
 ):
+    print("calculating buffer around arable from LULC...")
     region_shortname = get_region_shortname(region)
     if region_shortname is None:
         region_shortname = "region"
@@ -1662,6 +1685,7 @@ def belt_calculate_arable_buffer_eliminate(
     arable_buffer_aggregate_threshold_ha=0.1,   # минимальная площадь агрегированного участка
     arable_hole_area_threshold_m=5000   # минимальная площадь дыры в агрегированном участке
 ):
+    print("calculating arable_buffer_eliminate...")
     region_shortname = get_region_shortname(region)
     if region_shortname is None:
         region_shortname = "region"
@@ -1793,7 +1817,7 @@ def belt_calculate_centerlines(
     # 1) Project polygons to a local metric CRS (LAEA centered on bbox)
     # 2) For each Polygon in the GeoDataFrame (explode MultiPolygons), compute Centerline
     # 3) Collect LineStrings/MultiLineStrings, prune shorts, clip back and save
-
+    print("calculating belt centerlines...")
     if polygons_gdf is None or polygons_gdf.empty:
         return gpd.GeoDataFrame(geometry=[], crs=4326)
 
@@ -1917,6 +1941,7 @@ def belt_classify_main_gulch(
     belt_line=None,
     arable_gdf=None
 ):
+    print("classifying main and gulch belts...")
     # получить короткое название региона
     region_shortname = get_region_shortname(region)
     if region_shortname is None:
@@ -2025,6 +2050,7 @@ def belt_calculate_forestation(
     slope_threshold=12,
     meadows_raster='lulc/lulc_meadows.tif'
 ):
+    print("calculating forestation areas...")
     pass
     # Загрузка параметров подключения к PostgreSQL из JSON-файла
     try:   
@@ -2419,6 +2445,7 @@ def belt_calculate_secondary_belt(
     main_gully_belt_buf_size_m: int=20,
     meadow_gdf: gpd.GeoDataFrame=None
 ):
+    print("calculating secondary belts...")
     region_shortname = get_region_shortname(region)
     if region_shortname is None:
         region_shortname = "region"
@@ -2521,15 +2548,6 @@ def belt_calculate_secondary_belt(
     centrl_geom_col = secondary_belt_gdf_centrl.geometry.name
     secondary_belt_gdf_centrl[centrl_geom_col] = secondary_belt_gdf_centrl[centrl_geom_col].apply(lambda geom: gaussian_smooth(geom, sigma=1))
     
-    # Calculate 3m geodesic buffers around centerlines
-    secondary_belt_centrl_buf = calculate_geod_buffers(
-        secondary_belt_gdf_centrl,
-        'utm',
-        'value',
-        3
-    )
-    secondary_belt_gdf = secondary_belt_gdf.copy().set_geometry(secondary_belt_centrl_buf)
-    
     # Save smoothed centerlines to GeoPackage
     if secondary_belt_gdf_centrl is not None and not secondary_belt_gdf_centrl.empty:
         secondary_belt_gdf_centrl.to_file(
@@ -2538,7 +2556,16 @@ def belt_calculate_secondary_belt(
             )
         pass
     
-    secondary_belt_gdf.to_file(
+    # Calculate 3m geodesic buffers around centerlines
+    secondary_belt_centrl_buf = calculate_geod_buffers(
+        secondary_belt_gdf_centrl,
+        'utm',
+        'value',
+        3
+    )
+    secondary_belt_gdf_centrl = secondary_belt_gdf_centrl.copy().set_geometry(secondary_belt_centrl_buf)
+    
+    secondary_belt_gdf_centrl.to_file(
             os.path.join(current_dir, 'result', f'{region_shortname}_limitations.gpkg'),
             layer=f'{region_shortname}_secondary_belt'
         )
@@ -2568,6 +2595,7 @@ def calculate_forest_belt(
     tpi_window_size_m=1000,
     slope_threshold=12
 ):
+    print("start calculating forest belts")
     region_shortname = get_region_shortname(region)
     if region_shortname is None:
         region_shortname = "region"
@@ -2930,9 +2958,14 @@ def prepare_limitations(
             for c in all_cols:
                 if c not in g.columns:
                     g[c] = pd.NA
+        # Filter out columns that are all-NA across all parts to avoid FutureWarning
+        valid_cols = []
+        for c in all_cols:
+            if any(not g[c].isna().all() for g in parts):
+                valid_cols.append(c)
         # Concatenate
         merged_gdf = gpd.GeoDataFrame(
-            pd.concat([g[list(all_cols)] for g in parts], ignore_index=True),
+            pd.concat([g[valid_cols] for g in parts], ignore_index=True),
             geometry='geom',
             crs='EPSG:4326'
         )
@@ -3057,63 +3090,63 @@ if __name__ == '__main__':
 
     
 
-    forest_gdf = gpd.read_file(
-        'result/Lipetskaya_lulc.gpkg', 
-        layer='Lipetskaya_lulc_forest'
-        )
+    # forest_gdf = gpd.read_file(
+    #     'result/Lipetskaya_lulc.gpkg', 
+    #     layer='Lipetskaya_lulc_forest'
+    #     )
     limitations_all = gpd.read_file(
         'result/Lipetskaya_limitations.gpkg', 
         layer='Lipetskaya_all_limitations'
         )
-    road_OSM_cover_buf = gpd.read_file(
-        'result/Lipetskaya_limitations.gpkg', 
-        layer='Lipetskaya_road_OSM_cover_buf'
-        )
-    forest_50m = gpd.read_file(
-        'result/Lipetskaya_limitations.gpkg', 
-        layer='Lipetskaya_forest_50m'
-        )
-    arable_gdf = gpd.read_file(
-        'result/Lipetskaya_lulc.gpkg', 
-        layer='Lipetskaya_lulc_arable'
-        )
-    arable_buffer = gpd.read_file(
-        'result/Lipetskaya_Limitations.gpkg', 
-        layer='Lipetskaya_arable_buffer'
-        )
-    meadow_gdf = gpd.read_file(
-        'result/Lipetskaya_lulc.gpkg', 
-        layer='Lipetskaya_lulc_meadow'
-        )
-    limitation_full = gpd.read_file(
-        'result/Lipetskaya_Limitations.gpkg', 
-        layer='Lipetskaya_limitation_full'
-        )
-    arable_buffer_eliminate = gpd.read_file(
-        'result/Lipetskaya_Limitations.gpkg', 
-        layer='Lipetskaya_arable_buffer_eliminate'
-        )
-    belt_line = gpd.read_file(
-        'result/Lipetskaya_Limitations.gpkg', 
-        layer='Lipetskaya_belt_line'
-        )
+    # road_OSM_cover_buf = gpd.read_file(
+    #     'result/Lipetskaya_limitations.gpkg', 
+    #     layer='Lipetskaya_road_OSM_cover_buf'
+    #     )
+    # forest_50m = gpd.read_file(
+    #     'result/Lipetskaya_limitations.gpkg', 
+    #     layer='Lipetskaya_forest_50m'
+    #     )
+    # arable_gdf = gpd.read_file(
+    #     'result/Lipetskaya_lulc.gpkg', 
+    #     layer='Lipetskaya_lulc_arable'
+    #     )
+    # arable_buffer = gpd.read_file(
+    #     'result/Lipetskaya_Limitations.gpkg', 
+    #     layer='Lipetskaya_arable_buffer'
+    #     )
+    # meadow_gdf = gpd.read_file(
+    #     'result/Lipetskaya_lulc.gpkg', 
+    #     layer='Lipetskaya_lulc_meadow'
+    #     )
+    # limitation_full = gpd.read_file(
+    #     'result/Lipetskaya_Limitations.gpkg', 
+    #     layer='Lipetskaya_limitation_full'
+    #     )
+    # arable_buffer_eliminate = gpd.read_file(
+    #     'result/Lipetskaya_Limitations.gpkg', 
+    #     layer='Lipetskaya_arable_buffer_eliminate'
+    #     )
+    # belt_line = gpd.read_file(
+    #     'result/Lipetskaya_Limitations.gpkg', 
+    #     layer='Lipetskaya_belt_line'
+    #     )
 
-    main_belt = gpd.read_file(
-        'result/Lipetskaya_Limitations.gpkg', 
-        layer='Lipetskaya_main_belt'
-        )
-    gully_belt = gpd.read_file(
-        'result/Lipetskaya_Limitations.gpkg', 
-        layer='Lipetskaya_gully_belt'
-        )
-    forestation = gpd.read_file(
-        'result/Lipetskaya_Limitations.gpkg', 
-        layer='Lipetskaya_forestation'
-        )
-    secondary_belt = gpd.read_file(
-        'result/Lipetskaya_Limitations.gpkg', 
-        layer='Lipetskaya_secondary_belt'
-        )
+    # main_belt = gpd.read_file(
+    #     'result/Lipetskaya_Limitations.gpkg', 
+    #     layer='Lipetskaya_main_belt'
+    #     )
+    # gully_belt = gpd.read_file(
+    #     'result/Lipetskaya_Limitations.gpkg', 
+    #     layer='Lipetskaya_gully_belt'
+    #     )
+    # forestation = gpd.read_file(
+    #     'result/Lipetskaya_Limitations.gpkg', 
+    #     layer='Lipetskaya_forestation'
+    #     )
+    # secondary_belt = gpd.read_file(
+    #     'result/Lipetskaya_Limitations.gpkg', 
+    #     layer='Lipetskaya_secondary_belt'
+    #     )
 
 
     region_shortname = get_region_shortname('Липецкая область')
@@ -3214,38 +3247,44 @@ if __name__ == '__main__':
     #     slope_threshold=12
     # )
 
-    belt_calculate_secondary_belt(
-        postgres_info='.secret/.gdcdb',
-        region='Липецкая область',
-        regions_table='admin.hse_russia_regions',
-        region_buf_size=5000,
-        road_table='osm.gis_osm_roads_free',
-        road_one_side_buf_size_m=6,
-        limitation_full=limitation_full,
-        main_belt=main_belt,
-        gully_belt=gully_belt,
-        meadow_gdf=meadow_gdf
-    )
+    # belt_calculate_secondary_belt(
+    #     postgres_info='.secret/.gdcdb',
+    #     region='Липецкая область',
+    #     regions_table='admin.hse_russia_regions',
+    #     region_buf_size=5000,
+    #     road_table='osm.gis_osm_roads_free',
+    #     road_one_side_buf_size_m=6,
+    #     limitation_full=limitation_full,
+    #     main_belt=main_belt,
+    #     gully_belt=gully_belt,
+    #     meadow_gdf=meadow_gdf
+    # )
 
     pass
     # prepare_road_limitations(
     #     region='Липецкая область'
     # )
 
-    # calculate_forest_belt(
-    #     region='Липецкая область',
-    #     limitations_all=limitations_all,   # geodataframe derived from prepare_limitations
-    #     lulc_link='lulc/S2LULC_10m_LAEA_48_202507081046_sample.tif',
-    #     postgres_info='.secret/.gdcdb',
-    #     regions_table='admin.hse_russia_regions',
-    #     region_buf_size=5000,
-    #     road_table='osm.gis_osm_roads_free',
-    #     road_buf_size_rule={
-    #         "fclass  in  ('primary', 'primary_link')": 80,
-    #         "fclass in ('motorway' , 'motorway_link')": 80,
-    #         "fclass in ('secondary', 'secondary_link')": 70,
-    #         "fclass in ('tertiary', 'tertiary_link')": 70,
-    #         "fclass in ('trunk', 'trunk_link')": 70,
-    #         "fclass in ('unclassified')": 70,
-    #     }
-    # )
+    calculate_forest_belt(
+        region='Липецкая область',
+        limitations_all=limitations_all,   # geodataframe derived from prepare_limitations
+        lulc_link='lulc/S2LULC_10m_LAEA_48_202507081046.tif',
+        postgres_info='.secret/.gdcdb',
+        regions_table='admin.hse_russia_regions',
+        region_buf_size=5000,
+        road_table='osm.gis_osm_roads_free',
+        road_buf_size_rule={
+            "fclass  in  ('primary', 'primary_link')": 80,
+            "fclass in ('motorway' , 'motorway_link')": 80,
+            "fclass in ('secondary', 'secondary_link')": 70,
+            "fclass in ('tertiary', 'tertiary_link')": 70,
+            "fclass in ('trunk', 'trunk_link')": 70,
+            "fclass in ('unclassified')": 70,
+        },
+        fabdem_tiles_table='elevation.fabdem_v1_2_tiles',
+        fabdem_zip_path=r"\\172.21.204.20\geodata\_PROJECTS\pkp\vm0047_prod\dem_fabdem",
+        meadows_raster='lulc/lulc_meadows.tif',
+        tpi_threshold=2,
+        tpi_window_size_m=1000,
+        slope_threshold=12
+    )
