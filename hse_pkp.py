@@ -1691,16 +1691,21 @@ def belt_calculate_arable_buffer_eliminate(
         region_shortname = "region"
     ####################буферные зоны - начало######################
     # вырезать буферные зоны по слою meadow 
+    print("clipping arable_buffer by meadow...")
     arable_buffer_lim = gpd.clip(arable_buffer, meadow_gdf)
     # cтереть участки, пересекающиеся с limitation_full
+    print("erasaing arable_buffer by limitation_full...")
     arable_buffer_lim = gpd.overlay(arable_buffer_lim, limitation_full, how='difference')
     # разбить составные на отдельные объекты
+    print("exploding arable_buffer_lim...")
     arable_buffer_lim = arable_buffer_lim.explode()
     # сохраняем в arable_buffer_lim
+    print("saving arable_buffer_lim...")
     arable_buffer_lim.to_file(
         f"result/{region_shortname}_limitations.gpkg",
         layer=f"{region_shortname}_arable_buffer_lim"
     )
+    print(f"saved arable_buffer_lim to result/{region_shortname}_limitations.gpkg...")
     minx, miny, maxx, maxy = arable_buffer_lim.total_bounds
     distance_crs = crs.CRS.from_proj4(
         f"+proj=laea +lat_0={(miny + maxy) / 2} +lon_0={(minx + maxx) / 2} " \
@@ -1711,7 +1716,7 @@ def belt_calculate_arable_buffer_eliminate(
     arable_buffer_aggregate = arable_buffer_lim.to_crs(distance_crs)
     
     arable_buffer_aggregate = arable_buffer_aggregate.reset_index(drop=True)
-    
+    print(f"aggregating arable_buffer_aggregate...")
     pairs = arable_buffer_aggregate.sjoin(
         arable_buffer_aggregate,
         predicate="dwithin",
@@ -1731,6 +1736,7 @@ def belt_calculate_arable_buffer_eliminate(
     # arable_buffer_aggregate = arable_buffer_aggregate.explode()
     arable_buffer_aggregate = arable_buffer_aggregate.to_crs(4326)
     
+    print(f"calculating areas for arable_buffer_aggregate...")
     geod = Geod(ellps='WGS84')
     areas_ha = []
     for geom in arable_buffer_aggregate.geometry:
@@ -1745,6 +1751,7 @@ def belt_calculate_arable_buffer_eliminate(
     arable_buffer_aggregate['area_ha'] = pd.to_numeric(areas_ha, errors='coerce')
 
     # Удалить объекты площадью <= 0.1 га
+    print(f"filtering arable_buffer_aggregate by area...")
     arable_buffer_aggregate = arable_buffer_aggregate[arable_buffer_aggregate['area_ha'] > arable_buffer_aggregate_threshold_ha].copy()
 
     arable_buffer_aggregate.to_file(
@@ -1753,6 +1760,7 @@ def belt_calculate_arable_buffer_eliminate(
     )
 
     # smoothing with different options 
+    print("smoothing arable_buffer_aggregate...")
     if not arable_buffer_aggregate.empty:
         smooth_tolerance = 10  # meters
         g_proj = arable_buffer_aggregate.to_crs(distance_crs)
@@ -1776,6 +1784,7 @@ def belt_calculate_arable_buffer_eliminate(
         arable_buffer_smooth = g_proj.to_crs(4326)
 
         # Recompute area after smoothing
+        print(f"recalculating areas for arable_buffer_aggregate after smoothing...")
         geod = Geod(ellps='WGS84')
         areas_ha = []
         for geom in arable_buffer_smooth.geometry:
@@ -1794,13 +1803,15 @@ def belt_calculate_arable_buffer_eliminate(
         )
 
     # Удаляем пустоты внутри полигонов, критерий – площадь 0,5 га
+    print(f"eliminating small holes in arable_buffer_smooth...")
     arable_buffer_eliminate = arable_buffer_smooth.to_crs(distance_crs)
     arable_buffer_eliminate["geometry"] = arable_buffer_eliminate.geometry.apply(lambda g: drop_small_holes_any(g, min_hole_area=arable_hole_area_threshold_m))  # CRS units
-    arable_buffer_eliminate = arable_buffer_eliminate.to_crs(4326)
+    arable_buffer_eliminate = arable_buffer_eliminate.to_crs(4326)    
     arable_buffer_eliminate.to_file(
         f"result/{region_shortname}_limitations.gpkg",
         layer=f"{region_shortname}_arable_buffer_eliminate"
     )
+    print(f"saved arable_buffer_eliminate to result/{region_shortname}_limitations.gpkg...")
     return arable_buffer_eliminate
 
 
@@ -3110,18 +3121,18 @@ if __name__ == '__main__':
     #     'result/Lipetskaya_lulc.gpkg', 
     #     layer='Lipetskaya_lulc_arable'
     #     )
-    # arable_buffer = gpd.read_file(
-    #     'result/Lipetskaya_Limitations.gpkg', 
-    #     layer='Lipetskaya_arable_buffer'
-    #     )
-    # meadow_gdf = gpd.read_file(
-    #     'result/Lipetskaya_lulc.gpkg', 
-    #     layer='Lipetskaya_lulc_meadow'
-    #     )
-    # limitation_full = gpd.read_file(
-    #     'result/Lipetskaya_Limitations.gpkg', 
-    #     layer='Lipetskaya_limitation_full'
-    #     )
+    arable_buffer = gpd.read_file(
+        'result/Lipetskaya_Limitations.gpkg', 
+        layer='Lipetskaya_arable_buffer'
+        )
+    meadow_gdf = gpd.read_file(
+        'result/Lipetskaya_lulc.gpkg', 
+        layer='Lipetskaya_lulc_meadow'
+        )
+    limitation_full = gpd.read_file(
+        'result/Lipetskaya_Limitations.gpkg', 
+        layer='Lipetskaya_limitation_full'
+        )
     # arable_buffer_eliminate = gpd.read_file(
     #     'result/Lipetskaya_Limitations.gpkg', 
     #     layer='Lipetskaya_arable_buffer_eliminate'
@@ -3208,13 +3219,13 @@ if __name__ == '__main__':
     # )
     # pass
 
-    # arable_buffer_eliminate = belt_calculate_arable_buffer_eliminate(
-    #     region='Липецкая область',
-    #     arable_buffer=arable_buffer,
-    #     meadow_gdf=meadow_gdf,
-    #     limitation_full=limitation_full
-    # )
-    # pass
+    arable_buffer_eliminate = belt_calculate_arable_buffer_eliminate(
+        region='Липецкая область',
+        arable_buffer=arable_buffer,
+        meadow_gdf=meadow_gdf,
+        limitation_full=limitation_full
+    )
+    pass
 
     # _, belt_line = belt_calculate_centerlines(
     #     region='Липецкая область',
